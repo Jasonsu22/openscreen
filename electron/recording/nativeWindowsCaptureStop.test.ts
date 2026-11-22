@@ -1,5 +1,8 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -9,9 +12,12 @@ import {
 	readMicrophoneNotFound,
 	readMicrophoneUnavailable,
 	readSecondaryWindowsApplied,
+	readSoftwareEncoderAdapters,
+	readStalledEncoderAdapter,
 	readStoppedPath,
 	readWebcamFormat,
 	readWebcamUnavailable,
+	rememberSoftwareEncoderAdapter,
 	terminateNativeWindowsCapture,
 	waitForNativeWindowsCaptureStop,
 } from "./nativeWindowsCaptureStop";
@@ -82,6 +88,61 @@ describe("readStoppedPath", () => {
 		expect(readStoppedPath("Recording started\n[stop-timing] step=microphone elapsed_ms=0\n")).toBe(
 			null,
 		);
+	});
+});
+
+describe("readStalledEncoderAdapter", () => {
+	it("reads the adapter the helper gave up on", () => {
+		const output = [
+			'{"event":"hardware-encoder-stalled","schemaVersion":2,"adapter":"AMD Radeon RX 9070 XT"}',
+			'{"event":"stop-timeout","schemaVersion":2,"step":"encoder-finalize"}',
+		].join("\r\n");
+		expect(readStalledEncoderAdapter(output)).toBe("AMD Radeon RX 9070 XT");
+	});
+
+	it("unescapes the name", () => {
+		const output =
+			'{"event":"hardware-encoder-stalled","schemaVersion":2,"adapter":"A \\"B\\" \\\\C"}';
+		expect(readStalledEncoderAdapter(output)).toBe('A "B" \\C');
+	});
+
+	it("is null for a plain watchdog timeout or an unnamed adapter", () => {
+		expect(
+			readStalledEncoderAdapter(
+				'{"event":"stop-timeout","schemaVersion":2,"step":"encoder-finalize"}',
+			),
+		).toBeNull();
+		expect(
+			readStalledEncoderAdapter(
+				'{"event":"hardware-encoder-stalled","schemaVersion":2,"adapter":""}',
+			),
+		).toBeNull();
+	});
+});
+
+describe("rememberSoftwareEncoderAdapter", () => {
+	let dir: string;
+	beforeEach(async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-encoder-adapters-"));
+	});
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it("keeps each adapter once and reads a missing file as none", async () => {
+		const file = path.join(dir, "adapters.json");
+		expect(await readSoftwareEncoderAdapters(file)).toEqual([]);
+		await rememberSoftwareEncoderAdapter(file, "AMD Radeon RX 9070 XT");
+		await rememberSoftwareEncoderAdapter(file, "AMD Radeon RX 9070 XT");
+		await rememberSoftwareEncoderAdapter(file, "Other GPU");
+		expect(await readSoftwareEncoderAdapters(file)).toEqual(["AMD Radeon RX 9070 XT", "Other GPU"]);
+		expect(await fs.readdir(dir)).toEqual(["adapters.json"]);
+	});
+
+	it("reads a corrupt file as none", async () => {
+		const file = path.join(dir, "adapters.json");
+		await fs.writeFile(file, "{not json", "utf-8");
+		expect(await readSoftwareEncoderAdapters(file)).toEqual([]);
 	});
 });
 
@@ -307,6 +368,8 @@ describe("waitForNativeWindowsCaptureStop", () => {
 	 */
 	it("settles immediately when the helper has already exited", async () => {
 		helper.exitCode = 0;
+		helper.stdout.destroy();
+		helper.stderr.destroy();
 
 		const result = await waitForNativeWindowsCaptureStop({
 			proc: asProc(helper),
@@ -317,6 +380,32 @@ describe("waitForNativeWindowsCaptureStop", () => {
 		expect(result).toEqual({ ok: true, screenVideoPath: "C:\\rec\\a.mp4" });
 		// No timers were needed: nothing was ever scheduled to wait on.
 		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	/**
+	 * Exited is not drained: the pipes can still hold the log's tail when the
+	 * stop runs, and reading then lost "Recording stopped" (issue #1561).
+	 */
+	it("waits for the output to drain when the helper exited but its pipes are open", async () => {
+		helper.exitCode = 0;
+		let output = "Recording started\n";
+		let settled = false;
+		const pending = waitForNativeWindowsCaptureStop({
+			proc: asProc(helper),
+			targetPath: null,
+			readOutput: () => output,
+		}).then((result) => {
+			settled = true;
+			return result;
+		});
+
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		output += "Recording stopped. Output path: C:\\rec\\a.mp4\n";
+		helper.emit("close", 0);
+
+		await expect(pending).resolves.toEqual({ ok: true, screenVideoPath: "C:\\rec\\a.mp4" });
 	});
 
 	/**

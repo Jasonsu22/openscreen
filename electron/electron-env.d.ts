@@ -46,6 +46,10 @@ interface Window {
 				meta: import("../src/native/contracts").CompositorSharedFrameMeta,
 			) => void,
 		) => () => void;
+		reportRecordingOutcome?: (
+			outcome: import("../src/lib/recordingSession").RecordingOutcome,
+		) => Promise<{ success: boolean }>;
+
 		getSources: (opts: Electron.SourcesOptions) => Promise<ProcessedDesktopSource[]>;
 		switchToEditor: () => Promise<void>;
 		switchToHud: () => Promise<void>;
@@ -58,6 +62,15 @@ interface Window {
 		usesSystemSourcePicker?: () => Promise<boolean>;
 		/** Name of the last source picked in Apple's picker, for display only: it is not selected. */
 		getLastPickedSource?: () => Promise<string | null>;
+		prepareCameraPreviewCapture?: () => Promise<number | undefined>;
+		restoreCameraPreviewCapture?: (token: number) => Promise<void>;
+		onCameraPreviewAvailability?: (callback: (available: boolean) => void) => () => void;
+		configureCameraPreview?: (enabled: boolean, visible: boolean) => Promise<void>;
+		sendCameraPreviewFrame?: (jpeg: string, aspectRatio: number) => Promise<void>;
+		resizeCameraPreview?: (width: number) => Promise<void>;
+		hideCameraPreview?: () => Promise<void>;
+		onCameraPreviewFrame?: (callback: (jpeg: string) => void) => () => void;
+		onCameraPreviewHidden?: (callback: () => void) => () => void;
 		openNotes: () => Promise<{
 			opened: boolean;
 			reason?: string;
@@ -149,7 +162,8 @@ interface Window {
 			recording: boolean,
 			recordingId?: number,
 			cursorCaptureMode?: import("../src/lib/recordingSession").CursorCaptureMode,
-		) => Promise<void>;
+			reserveOnly?: boolean,
+		) => Promise<{ success: boolean; error?: string }>;
 		isNativeWindowsCaptureAvailable: () => Promise<{
 			success: boolean;
 			available: boolean;
@@ -191,6 +205,11 @@ interface Window {
 		startNativeMacRecording: (
 			request: import("../src/lib/nativeMacRecording").NativeMacRecordingRequest,
 		) => Promise<import("../src/lib/nativeMacRecording").NativeMacRecordingStartResult>;
+		onNativeMacPresenterOverlayChanged: (
+			callback: (
+				event: import("../src/lib/nativeMacRecording").NativeMacPresenterOverlayEvent,
+			) => void,
+		) => () => void;
 		onNativeMacSystemAudioUnavailable: (callback: () => void) => () => void;
 		pauseNativeMacRecording: () => Promise<{
 			success: boolean;
@@ -229,6 +248,7 @@ interface Window {
 		isNativeLinuxCaptureAvailable: () => Promise<{
 			success: boolean;
 			available: boolean;
+			backend?: "x11" | "pipewire";
 			helperPath?: string;
 			reason?: "unsupported-platform" | "missing-helper" | string;
 			error?: string;
@@ -468,7 +488,13 @@ interface Window {
 		getAppInfo: () => Promise<{ version: string; canCheckForUpdates: boolean }>;
 		checkForUpdates: () => Promise<void>;
 		showAbout: () => Promise<void>;
+		saveDiagnostics: () => Promise<void>;
 		canCheckForUpdatesNow: () => Promise<boolean>;
+		getUpdateBadge: () => Promise<import("./background-update").UpdateBadge | null>;
+		onUpdateBadgeChanged: (
+			callback: (badge: import("./background-update").UpdateBadge | null) => void,
+		) => () => void;
+		applyUpdate: () => Promise<void>;
 		revealInFolder: (
 			filePath: string,
 		) => Promise<{ success: boolean; error?: string; message?: string }>;
@@ -491,6 +517,8 @@ interface Window {
 			shift?: boolean;
 			alt?: boolean;
 		}) => Promise<{ success: boolean }>;
+		/** False where the session grants no global shortcut (GNOME Wayland). */
+		isGlobalShortcutAvailable: () => Promise<boolean>;
 		hudOverlayHide: () => void;
 		hudOverlayClose: () => void;
 		setHudOverlayIgnoreMouseEvents: (ignore: boolean) => void;

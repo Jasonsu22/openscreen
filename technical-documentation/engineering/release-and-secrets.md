@@ -1,6 +1,6 @@
 # Release and secrets
 
-OpenScreen's release machinery lives in `.github/workflows/prerelease.yml`, `promote.yml`, and `build.yml`; its credentials are repository secrets and variables consumed by those workflows and the downstream package and Discord automations. This page is the operational reference for cutting releases and maintaining those credentials.
+OpenScreen's release machinery lives in `.github/workflows/prerelease.yml`, `promote.yml`, and `build.yml`; its credentials are secrets of the `release` environment (see [Release environment](#release-environment)), plus repository secrets and variables for the Discord automations. This page is the operational reference for cutting releases and maintaining those credentials.
 
 ## Release flow
 
@@ -16,10 +16,10 @@ The workflow computes `X.Y.Z-rc.N`, migrates items from `Next Release` to the `v
 
 `build.yml` does have a `push:` trigger on `v*` tags, but the release workflows do not rely on it. The dispatch is explicit *and* pinned to the tag, for two separate reasons:
 
-- **Explicit**, because a tag pushed with `GITHUB_TOKEN` does not fire `build.yml`'s `push:` trigger in this org's setup — GitHub withholds that to stop workflows triggering each other in a loop. `promote.yml` does push the stable tag that way, so without the dispatch nothing would build.
+- **Explicit**, because both tags sit on a `chore(release): bump … [skip ci]` commit, and `[skip ci]` stops the tag push from firing `build.yml`'s `push:` trigger. Without the dispatch nothing would build.
 - **Pinned with `--ref`**, because the build must check out the **tag**, not the default branch. The version bump lives only on the release branch; `main` still carries the previous stable version, and `build.yml`'s publish step would fail its guard (`package.json version X does not match <tag>`).
 
-The two workflows push their tags with different credentials, which is deliberate: `promote.yml` uses `GITHUB_TOKEN` (a tag is a ref, not a file change), while `prerelease.yml` pushes the RC tag with `OPENSCREEN_RELEASE_TOKEN`. A `GITHUB_TOKEN` tag push is answered with `remote: Internal Server Error` — a 500, not a 403 — by a tag ruleset that rejects the Actions token, and that failure took down the whole `v1.8.0-rc.1` cut, skipping the build trigger and the Discord announce with it.
+Both workflows push their branches and tags with `OPENSCREEN_RELEASE_TOKEN`, and their checkout sets `persist-credentials: false`. That second part is what makes the first one true: `actions/checkout` otherwise leaves the `GITHUB_TOKEN` as an `http.extraheader`, which git sends even when the push URL carries the PAT, and GitHub authenticates the header. Every push then runs as `github-actions[bot]`. The `release-branches` ruleset rejects that bot (`Cannot create ref due to creations being restricted`), which is how the `v2.3.0-rc.1` cut failed; before it, a tag ruleset answered the same bot with a 500 and took down `v1.8.0-rc.1`. The bypass list names the PAT owner, so the pushes have to really carry the PAT.
 
 **Which whisper helper a build ships.** `build.yml` does not compile `whisper-stt-server`: `scripts/stage-whisper-stt.sh` downloads it from a `build-whisper-stt.yml` run, which runs on the pushes that touch the helper. It takes the most recent successful run built from the **same helper sources** as the commit being packaged (the `electron/native/whisper-stt` tree, `scripts/build-whisper-stt.sh` and the workflow, compared by git object id), so the release branch's cherry-pick of a helper change matches the run built from `main`. No such run fails the build, with the command that makes one. Until 2026-09-30 it took the most recent artifact of any branch: `v2.0.0-rc.1` shipped whatever `main` had last built, and a PR branch pushed an hour later would have decided what rc.2 shipped. So after cherry-picking a helper change, let a `build-whisper-stt` run of those sources finish before dispatching `prerelease.yml`.
 
@@ -71,20 +71,24 @@ RC=1.5.0-rc.1                          # bump the rc.N for every later candidate
 git checkout -b release/v1.5.0 main    # rc.2+: git checkout release/v1.5.0 instead
 node .github/scripts/set-release-version.mjs "$RC"
 bash .github/scripts/refresh-nix-npm-hash.sh   # needs Nix; the lockfile version is in the hash
-git commit -am "chore(release): bump to $RC [skip ci]"
+git commit --allow-empty -am "chore(release): bump to $RC [skip ci]"
 git push origin release/v1.5.0
 git tag "v$RC" && git push origin "v$RC"
+gh workflow run build.yml --ref "v$RC" -f release_tag="v$RC" -f arch=both   # [skip ci]: the tag push builds nothing
+
+# STOP: promote only once that build published the RC and it passed the
+# whole manual e2e checklist (see "Promote to stable" above).
 
 # Promote (skips milestone close and Discord announce)
 git checkout release/v1.5.0
 node .github/scripts/set-release-version.mjs 1.5.0
 bash .github/scripts/refresh-nix-npm-hash.sh
-git commit -am "chore(release): bump to 1.5.0 [skip ci]"
+git commit --allow-empty -am "chore(release): bump to 1.5.0 [skip ci]"
 git push origin release/v1.5.0
 git tag v1.5.0 && git push origin v1.5.0
 ```
 
-A tag pushed with your own credentials **does** fire `build.yml`'s `push:` trigger, so the release publishes on its own and no explicit dispatch is needed — that restriction only applies to `GITHUB_TOKEN`. Either way the same `build.yml` builds and publishes.
+A tag pushed with your own credentials fires `build.yml`'s `push:` trigger, **except** when the tagged commit says `[skip ci]`, and the bump commits above do. So the block above dispatches the RC build itself; after the promote, dispatch the stable one the same way: `gh workflow run build.yml --ref v1.5.0 -f release_tag=v1.5.0 -f arch=both`. Do not dispatch the RC again: a second build re-uploads its assets with `--clobber` over the tested ones. That is how `v2.3.0-rc.1` was built.
 
 The fallback skips milestone migration/closure, release-branch automation, main synchronization, and Discord announcements, so the operator must preserve the freeze and the version/tag match by hand.
 
@@ -93,7 +97,7 @@ The fallback skips milestone migration/closure, release-branch automation, main 
 For a `v1.4.2` while `v1.5.0` is in flight:
 
 1. Branch `release/1.4.x` from the `v1.4.0` (or `v1.4.1`) tag.
-2. Cherry-pick the fix commits.
+2. Cherry-pick the fix commits. If the base tag predates the `environment: release` lines (see [Release environment](#release-environment)), add `environment: release` by hand to each job of that branch's workflows that reads a release secret: the original commit touches workflows an old line may not have, so it does not cherry-pick cleanly.
 3. Push the branch, then `git tag v1.4.2-rc.1` on the branch tip.
 4. `git push origin release/1.4.x v1.4.2-rc.1` — `build.yml` works from any branch.
 
@@ -105,6 +109,25 @@ No new workflow code is needed; the tag-pushed trigger is branch-agnostic.
 - **At RC cut**: `prerelease.yml` snapshots `Next Release` into a versioned `vX.Y.Z` milestone. The rolling milestone is left open and empty for new work.
 - **Between RC cut and promote**: any PR that merges during the RC window lands back in the empty `Next Release`. It is **not** retroactively added to `vX.Y.Z`. If a critical fix lands, cut `vX.Y.Z-rc.(N+1)` instead of promoting.
 - **At promote**: `promote.yml` closes the `vX.Y.Z` milestone and uses its closed issues to populate the Discord release announcement.
+
+## Release environment
+
+Write access merges code; it does not reach the release credentials or run the release automation. Three settings hold that line, and none of them lives in a file a pull request can change:
+
+- **The `release` environment** holds every release credential: `OPENSCREEN_RELEASE_TOKEN`, the six Apple signing secrets, the four Microsoft Store secrets, `WINGET_ACC_TOKEN`, `HOMEBREW_TAP_TOKEN` and `AUR_SSH_PRIVATE_KEY`. It requires the repository owner's approval before any job that names it starts. A repository secret would not do: it reaches any workflow pushed to any branch by anyone with write access, and `OPENSCREEN_RELEASE_TOKEN` acts as the owner, who bypasses the main ruleset.
+- **The `release-tags` ruleset** stops anyone but the owner and `github-actions[bot]` from moving or deleting a `v*` tag. Creating one stays open, because `promote.yml` pushes the stable tag with `GITHUB_TOKEN` (see above) and the GitHub Actions app cannot be a bypass actor of a repository ruleset. A stray tag publishes nothing: the build it starts still waits for approval.
+- **The `release-branches` ruleset** reserves `release/*` to the owner, so the frozen branch only moves through the owner or the token.
+
+Each job that reads a release credential declares `environment: release`: `prerelease`, `promote`, `build-macos`, `publish-release` and `publish-msstore` in `build.yml`, `publish-msstore.yml`, `publish-winget.yml`, `aur-publish.yml`, `update-homebrew-cask.yml` and `announce-release.yml`. A new job that needs one must declare it too, or it reads an empty value. Set or rotate a release secret with `gh secret set <NAME> --env release --repo getopenscreen/openscreen`, which prompts for the value. Variables (`AUR_PACKAGE_NAME`, `HOMEBREW_TAP_*`, the Discord channel IDs) stay repository variables: job-level `if:` conditions read them before the environment loads.
+
+**What it does not stop.** GitHub's write role can still create, edit and attach assets to a release by hand, and GitHub has no role that merges pull requests without also allowing that. Such a release is unsigned and starts no package publication without approval, but it is still a public release.
+
+**Immutable releases are on** (since 2026-11-07, for releases published from then on). Once published, a release's assets and tag are frozen; its title, notes, pre-release and latest flags stay editable. The pipeline is unaffected, because `gh release create` attaches the assets to a draft and publishes last. What it gives up: `publish-release`'s `--clobber` re-upload only works on a draft now, so a published release with a bad asset is fixed by a new version, and a deleted release's tag name can never be reused.
+
+**Moving the credentials** is only done once both of these hold, in this order:
+
+1. Every release branch still in use carries the `environment: release` lines. A tag builds with the `build.yml` it points at, so a branch cut before them, or a backport branch cut later from an older tag, needs the change before its next tag. An existing tag never acquires it, so a tag older than the move is not rebuilt: a broken release is fixed by a new version, as immutable releases require anyway. Without it, its builds read empty values and the macOS job falls back to an ad-hoc signature.
+2. Each secret is set in the environment, then its repository copy is deleted with `gh secret delete <NAME> --repo getopenscreen/openscreen`. An environment secret does not remove the repository secret of the same name, and the repository copy stays readable from any branch until it is deleted.
 
 ## Required release credential
 
@@ -121,10 +144,10 @@ Grant the token access only to the OpenScreen repository with:
 - Workflows: read and write, because the pushed release branch contains `.github/workflows/`.
 - Metadata: read-only.
 
-Create a fine-grained token from GitHub settings, set a finite expiry, and save it as the repository secret `OPENSCREEN_RELEASE_TOKEN`:
+Create a fine-grained token from GitHub settings, set a finite expiry, and save it as the `release` environment secret `OPENSCREEN_RELEASE_TOKEN`:
 
 ```bash
-gh secret set OPENSCREEN_RELEASE_TOKEN --body "<token>" --repo getopenscreen/openscreen
+gh secret set OPENSCREEN_RELEASE_TOKEN --env release --repo getopenscreen/openscreen
 ```
 
 Rotate it by creating the replacement with the same repository and scopes, updating the secret, verifying a non-destructive workflow/API operation, then revoking the old token. Do not revoke the previous token until the replacement is installed.

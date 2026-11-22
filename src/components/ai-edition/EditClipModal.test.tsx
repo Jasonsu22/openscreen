@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "@/contexts/I18nContext";
-import type { AxcutClip } from "@/lib/ai-edition/schema";
+import { type AxcutClip, clipCropRegionSchema } from "@/lib/ai-edition/schema";
 import { EditClipModal } from "./Modals";
 
 function renderWithI18n(ui: ReactElement) {
@@ -232,6 +232,7 @@ describe("EditClipModal crop from the keyboard", () => {
 			20,
 			105,
 			expect.objectContaining({ x: 0.01, y: 0, width: 0.99 }),
+			undefined,
 		);
 	});
 });
@@ -355,5 +356,290 @@ describe("EditClipModal playhead for framing the crop", () => {
 		if (!backdrop) throw new Error("no modal backdrop rendered");
 		fireEvent.click(backdrop);
 		expect(onClose).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("EditClipModal rotation", () => {
+	// Stored in source coordinates; on the turned picture this crop sits at 40%, 50%.
+	const TURNED: AxcutClip = {
+		...CLIP,
+		cropRegion: { x: 0.1, y: 0.2, width: 0.5, height: 0.3 },
+		rotation: 180,
+	};
+
+	function renderTurned(clip: AxcutClip = TURNED) {
+		const onApply = vi.fn();
+		renderWithI18n(
+			<EditClipModal
+				open
+				onClose={vi.fn()}
+				clip={clip}
+				assetMeta={ASSET}
+				videoSources={[]}
+				onApply={onApply}
+			/>,
+		);
+		return { onApply };
+	}
+	const cropText = () =>
+		screen.getByRole("slider", { name: "Crop" }).getAttribute("aria-valuetext");
+	const rotationButton = (name: string) =>
+		within(screen.getByRole("group", { name: "Rotation" })).getByRole("button", { name });
+
+	it("shows a turned clip's crop mirrored, and opens with nothing to apply", () => {
+		renderTurned();
+
+		expect(cropText()).toBe("40%, 50%, 50% × 30%");
+		expect(rotationButton("180°")).toHaveAttribute("aria-pressed", "true");
+		expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+	});
+
+	// The tip explains turning the picture, so it belongs on 180° alone: on 0° it described
+	// the opposite of what the button does.
+	it("explains the turn on 180° and leaves 0° without a tip", () => {
+		renderTurned();
+		const tooltipOf = (name: string) => {
+			const button = rotationButton(name);
+			// A keyboard focus: one the mouse gave opens no tooltip.
+			fireEvent.keyDown(window, { key: "Tab" });
+			act(() => button.focus());
+			const shown = screen.queryByRole("tooltip")?.textContent ?? null;
+			act(() => button.blur());
+			return shown;
+		};
+
+		expect(tooltipOf("180°")).toBe(
+			"Turn the picture upside down, e.g. for a camera mounted overhead",
+		);
+		expect(tooltipOf("0°")).toBeNull();
+	});
+
+	it("keeps the stored crop when the rotation is toggled", () => {
+		const { onApply } = renderTurned();
+
+		fireEvent.click(rotationButton("0°"));
+		// The frame jumps with the picture: upright, the stored crop shows as stored.
+		expect(cropText()).toBe("10%, 20%, 50% × 30%");
+		fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+		expect(onApply).toHaveBeenCalledWith(20, 105, undefined, 0);
+	});
+
+	it("turns an upright clip, keeping its crop", () => {
+		const { onApply } = renderTurned({ ...TURNED, rotation: undefined });
+
+		expect(cropText()).toBe("10%, 20%, 50% × 30%");
+		fireEvent.click(rotationButton("180°"));
+		expect(cropText()).toBe("40%, 50%, 50% × 30%");
+		fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+		expect(onApply).toHaveBeenCalledWith(20, 105, undefined, 180);
+	});
+
+	it("Reset restores the stored rotation", () => {
+		renderTurned();
+
+		fireEvent.click(rotationButton("0°"));
+		expect(screen.getByRole("button", { name: "Reset" })).toBeEnabled();
+		fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+
+		expect(rotationButton("180°")).toHaveAttribute("aria-pressed", "true");
+		expect(cropText()).toBe("40%, 50%, 50% × 30%");
+		expect(screen.getByRole("button", { name: "Reset" })).toBeDisabled();
+		expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+	});
+
+	it("Apply converts a crop moved on the turned picture back to source coordinates", () => {
+		const { onApply } = renderTurned();
+
+		// One step right and one down on the turned picture is one left and one up in the source.
+		const crop = screen.getByRole("slider", { name: "Crop" });
+		fireEvent.keyDown(crop, { key: "ArrowRight" });
+		fireEvent.keyDown(crop, { key: "ArrowDown" });
+		expect(cropText()).toBe("41%, 51%, 50% × 30%");
+		fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+		expect(onApply).toHaveBeenCalledWith(
+			20,
+			105,
+			{
+				x: expect.closeTo(0.09, 9),
+				y: expect.closeTo(0.19, 9),
+				width: expect.closeTo(0.5, 9),
+				height: expect.closeTo(0.3, 9),
+			},
+			undefined,
+		);
+	});
+
+	it("saves a crop moved flush against the turned picture's edge", () => {
+		// 1 - 0.9 - 0.1 is -2.8e-17 in floating point, which the schema rejects as below 0.
+		const { onApply } = renderTurned({
+			...TURNED,
+			cropRegion: { x: 0.01, y: 0.01, width: 0.1, height: 0.1 },
+		});
+
+		const crop = screen.getByRole("slider", { name: "Crop" });
+		fireEvent.keyDown(crop, { key: "ArrowRight" });
+		fireEvent.keyDown(crop, { key: "ArrowDown" });
+		expect(cropText()).toBe("90%, 90%, 10% × 10%");
+		fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+
+		const saved = onApply.mock.calls[0][2];
+		expect(saved.x).toBeGreaterThanOrEqual(0);
+		expect(saved.y).toBeGreaterThanOrEqual(0);
+		expect(clipCropRegionSchema.safeParse(saved).success).toBe(true);
+	});
+
+	it("turns the crop preview's picture, not the frame drawn over it", () => {
+		renderWithI18n(
+			<EditClipModal
+				open
+				onClose={vi.fn()}
+				clip={TURNED}
+				assetMeta={ASSET}
+				videoSources={[{ id: "asset_1", src: "file:///rec.mp4", label: "rec" }]}
+				onApply={vi.fn()}
+			/>,
+		);
+		const video = document.querySelector("video");
+		if (!video) throw new Error("no preview video rendered");
+		expect(video.style.transform).toBe("rotate(180deg)");
+
+		fireEvent.click(rotationButton("0°"));
+		expect(video.style.transform).toBe("");
+	});
+});
+
+describe("EditClipModal crop in pixels", () => {
+	beforeAll(() => {
+		// jsdom has no media pipeline: report a loaded 1920x1080 source.
+		Object.defineProperty(HTMLMediaElement.prototype, "readyState", {
+			configurable: true,
+			get: () => 1,
+		});
+		Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+			configurable: true,
+			get: () => 0,
+			set: vi.fn(),
+		});
+		HTMLMediaElement.prototype.pause = vi.fn();
+		Object.defineProperty(HTMLVideoElement.prototype, "videoWidth", {
+			configurable: true,
+			get: () => 1920,
+		});
+		Object.defineProperty(HTMLVideoElement.prototype, "videoHeight", {
+			configurable: true,
+			get: () => 1080,
+		});
+	});
+
+	function renderWithVideo(videoSources: Array<{ id: string; src: string; label: string }>) {
+		const onApply = vi.fn();
+		renderWithI18n(
+			<EditClipModal
+				open
+				onClose={vi.fn()}
+				clip={CLIP}
+				assetMeta={ASSET}
+				videoSources={videoSources}
+				onApply={onApply}
+			/>,
+		);
+		return { onApply };
+	}
+	const withVideo = [{ id: "asset_1", src: "file:///rec.mp4", label: "rec" }];
+	const field = (name: string) => screen.getByLabelText(name) as HTMLInputElement;
+	const cropText = () =>
+		screen.getByRole("slider", { name: "Crop" }).getAttribute("aria-valuetext");
+
+	it("shows the whole frame in pixels, labelled for each side", () => {
+		renderWithVideo(withVideo);
+		expect(field("X (px)").value).toBe("0");
+		expect(field("Y (px)").value).toBe("0");
+		expect(field("Width (px)").value).toBe("1920");
+		expect(field("Height (px)").value).toBe("1080");
+	});
+
+	it("stays off until the source size is known", () => {
+		renderWithVideo([]);
+		expect(field("Width (px)")).toBeDisabled();
+		expect(field("X (px)").value).toBe("");
+	});
+
+	// Typing is a draft until blur or Enter, the way the browser's own number fields commit.
+	const type = (name: string, value: string) => {
+		fireEvent.change(field(name), { target: { value } });
+		fireEvent.blur(field(name));
+	};
+	// The whole 16:9 frame opens on the 16:9 preset, whose lock a typed size keeps.
+	const unlock = () => fireEvent.click(screen.getByRole("button", { name: "Free" }));
+
+	it("applies typed pixels as a crop, clamped to the frame", () => {
+		const { onApply } = renderWithVideo(withVideo);
+		unlock();
+		type("Width (px)", "960");
+		fireEvent.change(field("X (px)"), { target: { value: "5000" } });
+		expect(field("X (px)").value).toBe("5000"); // what is being typed stays until blur
+		fireEvent.blur(field("X (px)"));
+		expect(field("X (px)").value).toBe("960");
+
+		fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+		expect(onApply).toHaveBeenCalledWith(
+			20,
+			105,
+			expect.objectContaining({ x: 0.5, y: 0, width: 0.5, height: 1 }),
+			undefined,
+		);
+	});
+
+	it("does not touch the crop until the typed value is committed", () => {
+		renderWithVideo(withVideo);
+		unlock();
+		// The "1" of "1080" alone would snap the crop to its minimum size.
+		fireEvent.change(field("Width (px)"), { target: { value: "1" } });
+		expect(cropText()).toBe("0%, 0%, 100% × 100%");
+		fireEvent.change(field("Width (px)"), { target: { value: "1080" } });
+		fireEvent.keyDown(field("Width (px)"), { key: "Enter" });
+		expect(field("Width (px)").value).toBe("1080");
+		expect(cropText()).toBe("0%, 0%, 56% × 100%");
+	});
+
+	it("lets a field be cleared and retyped", () => {
+		renderWithVideo(withVideo);
+		fireEvent.change(field("Height (px)"), { target: { value: "" } });
+		expect(field("Height (px)").value).toBe("");
+		fireEvent.blur(field("Height (px)"));
+		expect(field("Height (px)").value).toBe("1080"); // an empty commit keeps the crop
+		type("Height (px)", "540");
+		expect(field("Height (px)").value).toBe("540");
+	});
+
+	it("follows the crop when it is moved with the keyboard", () => {
+		renderWithVideo(withVideo);
+		unlock();
+		type("Width (px)", "960");
+		fireEvent.keyDown(screen.getByRole("slider", { name: "Crop" }), { key: "ArrowRight" });
+		expect(field("X (px)").value).toBe("19"); // 1% of 1920, rounded
+		expect(field("Width (px)").value).toBe("960");
+	});
+
+	it("keeps a locked ratio when a size is typed", () => {
+		renderWithVideo(withVideo);
+		fireEvent.click(screen.getByRole("button", { name: "1:1" }));
+		type("Width (px)", "500");
+		expect(screen.getByRole("button", { name: "1:1" })).toHaveAttribute("aria-pressed", "true");
+		expect(field("Width (px)").value).toBe("500");
+		expect(field("Height (px)").value).toBe("500");
+	});
+
+	it("grows a size without lowering the position first", () => {
+		renderWithVideo(withVideo);
+		unlock();
+		type("Width (px)", "960");
+		type("X (px)", "960");
+		type("Width (px)", "1500");
+		expect(field("Width (px)").value).toBe("1500");
+		expect(field("X (px)").value).toBe("420");
 	});
 });

@@ -34,9 +34,9 @@ OpenScreen es un grabador de pantalla y editor de video gratis, con licencia MIT
 
 - **huggingface.co, una vez.** La primera transcripción descarga el modelo Whisper, de unos 264 MB, y un modelo de detección de voz de menos de 1 MB, cada uno verificado con un hash SHA-256. Después, la transcripción no necesita conexión.
 - **github.com, una vez por idioma.** En un equipo con GPU, la primera transcripción en inglés o en francés también descarga el modelo que vuelve a sincronizar cada palabra: unos 110 MB para el inglés, 350 MB para el francés.
-- **github.com y api.github.com.** Las compilaciones que se actualizan solas buscan una nueva versión cada 24 horas, y cuando tú lo pides. De forma predeterminada, solo te avisan de que hay una disponible.
+- **github.com y api.github.com.** Las compilaciones que se actualizan solas buscan una nueva versión un minuto después de abrirse, luego cada seis horas, y cuando tú lo pides. La descargan en segundo plano y muestran un botón de actualización; no se instala nada hasta que haces clic en él.
 - **fonts.googleapis.com, solo para una fuente añadida en 1.x.** Una fuente personalizada para anotaciones añadida en una versión anterior se sigue descargando al iniciar, aunque la 2.x ya no la dibuja.
-- **PostHog, una vez al día.** Un recuento anónimo de instalaciones activas, enviado a los servidores de PostHog en la UE. Contiene la versión de la app, el sistema operativo, la arquitectura del procesador, cómo se instaló la app, si se usó directamente o a través de su servidor MCP por un agente de IA, y si es el primer recuento de la semana y del mes. Nada más: ningún identificador de instalación (cada recuento recibe un ID aleatorio nuevo), ninguna dirección IP conservada, nada sobre tus grabaciones. Desmarca **Enviar recuento de uso anónimo** en el menú de la bandeja para desactivarlo, o define `DO_NOT_TRACK=1`.
+- **PostHog, una vez al día.** Un recuento anónimo de instalaciones activas, enviado a los servidores de PostHog en la UE. Contiene la versión de la app, el sistema operativo, la arquitectura del procesador, cómo se instaló la app, si se usó directamente o a través de su servidor MCP por un agente de IA, si es el primer recuento de la semana y del mes, y la semana en que se instaló la app. Nada más: ningún identificador de instalación (cada recuento recibe un ID aleatorio nuevo), ninguna dirección IP conservada, nada sobre tus grabaciones. Desmarca **Enviar recuento de uso anónimo** en el menú de la bandeja para desactivarlo, o define `DO_NOT_TRACK=1`.
 - **Tu proveedor de IA, solo si conectas uno.** La edición por chat envía tus mensajes y los datos del proyecto que lee, como la línea de tiempo y la transcripción. La traducción de subtítulos envía el texto de los subtítulos. Ambas permanecen desactivadas hasta que conectas un proveedor. Consulta [Edición con IA](./ai-editing.md).
 
 ## ¿OpenScreen recopila analíticas o informes de fallos? {#does-openscreen-collect-analytics-or-crash-reports}
@@ -44,7 +44,7 @@ OpenScreen es un grabador de pantalla y editor de video gratis, con licencia MIT
 **Un recuento diario anónimo, nada más.** La app no contiene ningún SDK de analíticas ni de informes de fallos, y nada registra lo que haces en ella.
 
 - Una vez al día, la app informa de que una instalación estuvo activa. [¿OpenScreen funciona sin conexión?](#does-openscreen-work-offline) detalla exactamente qué contiene ese recuento y cómo desactivarlo.
-- El recuento no lleva ningún identificador de instalación: cada uno recibe un ID aleatorio nuevo, y nada más en él es propio de tu equipo.
+- El recuento no lleva ningún identificador de instalación: cada uno recibe un ID aleatorio nuevo, y nada más en él es propio de tu equipo. La semana de instalación que lleva, como `2026-W44`, es la semana en que se instaló la app, la misma para todos los que la instalaron esa semana, no un identificador.
 - Las claves de los proveedores de IA se guardan cifradas con `safeStorage` de Electron. Si el cifrado no está disponible, la clave no se guarda.
 
 ## ¿Es seguro instalar OpenScreen? {#is-openscreen-safe-to-install}
@@ -79,7 +79,7 @@ En [Instalación](./installation.md) están los pasos para cada plataforma.
 ## ¿Puedo instalar OpenScreen con winget, Homebrew o Flathub? {#can-i-install-openscreen-with-winget-homebrew-or-flathub}
 
 - **winget:** sí, mediante el origen de la Store: `winget install --source msstore OpenScreen`.
-- **Homebrew:** sí, desde el tap oficial: `brew install --cask getopenscreen/openscreen/openscreen`. Cada versión estable actualiza el cask.
+- **Homebrew:** sí: `brew install --cask openscreen`, desde la lista principal de Homebrew, o desde el tap oficial: `brew install --cask getopenscreen/openscreen/openscreen`. Ambos siguen cada versión estable. El antiguo tap `siddharthvaddem/openscreen` se quedó en la v1.5.0.
 - **Flathub:** no hay ninguna ficha.
 
 ## ¿Es este el proyecto OpenScreen original? {#is-this-the-original-openscreen-project}
@@ -88,7 +88,7 @@ En [Instalación](./installation.md) están los pasos para cada plataforma.
 
 - Siddharth Vaddem creó OpenScreen y archivó el [repositorio original](https://github.com/siddharthvaddem/openscreen) después de la v1.5.0.
 - El desarrollo pasó a [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen) con su aprobación, con el mismo nombre y la misma licencia MIT.
-- El README archivado describe este proyecto como un proyecto derivado impulsado por la comunidad y dirigido por uno de los colaboradores principales. Se trata de Etienne Lescot, que lo mantiene. El enlace del README, github.com/EtienneLescot/openscreen, redirige al repositorio actual.
+- El README archivado ahora remite a este repositorio. Lo mantiene Etienne Lescot, uno de los colaboradores principales del proyecto original.
 - El repositorio archivado no recibe actualizaciones. La entrada del blog [Picking up OpenScreen (en inglés)](/blog/2026/06/15/picking-up-openscreen/) explica el traspaso.
 
 ## ¿OpenScreen tiene relación con openscreen.io u openscreen.net? {#is-openscreen-related-to-openscreenio-or-openscreennet}

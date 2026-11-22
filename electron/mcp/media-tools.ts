@@ -99,6 +99,14 @@ export interface TakeRecorder {
 }
 
 export interface MediaToolDeps {
+	/** The app may finish a client take from its HUD, without stopRecording. */
+	recordingActive?(): boolean;
+	/** Observes the app's current take without starting or stopping it. */
+	waitForRecording?: (
+		timeoutMs: number,
+		signal: AbortSignal,
+	) => Promise<RecordedTake & { recordingStartedAt: number }>;
+
 	/** The server these tools are served by: their texts say what is true on it. */
 	transport: McpTransport;
 	/** Whether a client may record and export: the in-app server's "MCP edits". */
@@ -136,6 +144,10 @@ export interface MediaToolDeps {
 	runTool: McpToolRunner;
 	now?(): number;
 }
+
+/** A take that asked for the webcam and came out without one: said, never left to be noticed. */
+export const NO_WEBCAM_PICTURE =
+	"The webcam delivered no picture, so the take has no camera. Call listSources and pass startRecording part of the name of a camera that works.";
 
 export const MAX_FRAMES = 12;
 // Wide enough to read UI text, small enough that a dozen frames stay cheap.
@@ -236,9 +248,9 @@ const TAKE_NOTES: Record<McpTransport, string> = {
 export function mediaPreamble(transport: McpTransport): string {
 	return [
 		"OpenScreen records the screen, turns each take into a project you edit with the document tools, and exports it as a video.",
-		"A demo goes: listSources, then startRecording, then drive the app, then stopRecording. It returns the projectId and a checkpointId. Edit with the document tools, always passing that projectId: every edit is saved to the project straight away, and restoreCheckpoint with the checkpointId takes the project back to the raw take in one step. Then exportVideo, and getFrames with the projectId to check the export before you hand it over: it takes the same ruler seconds as the document tools, so a trim or a speed region never shifts what you look at.",
+		"A demo goes: listSources, then startRecording, then drive the app, then stopRecording. To observe a take the user controls on the in-app HTTP server, call waitForRecording while it is recording or saving; the user stops it. It returns the projectId and a checkpointId. Edit with the document tools, always passing that projectId: every edit is saved to the project straight away, and restoreCheckpoint with the checkpointId takes the project back to the raw take in one step. Then exportVideo, and getFrames with the projectId to check the export before you hand it over: it takes the same ruler seconds as the document tools, so a trim or a speed region never shifts what you look at.",
 		"To edit a video you already have instead, createProject with its videoPath; importMedia adds a video or an audio file to a project.",
-		"Drive the app with the real mouse when you can: OpenScreen records the pointer, draws a clean cursor and zooms on the clicks as the editor does: clicks close in time and on screen share one zoom, and the first seconds and the end stay on the whole screen. If you drive it from a script instead (Playwright, CDP), the screen pointer never moves: log each action as the script runs it, then hand the log to setPointerTrack after stopRecording.",
+		"Drive the app with the real mouse when you can: OpenScreen records the pointer, draws a clean cursor and zooms on the clicks as the editor does: clicks close in time and on screen share one zoom, and the first seconds and the end stay on the whole screen. If you drive it from a script instead (Playwright, CDP), the screen pointer never moves: log each action as the script runs it, then hand the log to setPointerTrack after stopRecording. A video your script captured itself takes one too: createProject with it, then setPointerTrack with recordingStartedAt.",
 		TAKE_NOTES[transport],
 	].join("\n");
 }
@@ -246,6 +258,8 @@ export function mediaPreamble(transport: McpTransport): string {
 /** What a client reads of the media tools: their preamble, and the tools themselves. */
 export interface MediaTools {
 	preamble: string;
+	/** Includes a take's startup and project save, and an export's finalization. */
+	isBusy(): boolean;
 	/** Adds the tools to a server. Their state (the take, the exports) is shared by every
 	 *  server they are added to: the in-app server builds one per request. */
 	register(server: McpServer): void;
@@ -292,7 +306,7 @@ export const POINTER_TRACK_TOOL = "setPointerTrack";
 const POINTER_EVENTS = z
 	.array(
 		z.object({
-			at: z.number().describe("Epoch milliseconds, from Date.now()."),
+			at: z.number().describe("Milliseconds, from Date.now(): the clock recordingStartedAt is on."),
 			x: z.number().min(0).max(1),
 			y: z.number().min(0).max(1),
 			click: z.boolean().optional().describe("The action clicked here."),
@@ -306,24 +320,31 @@ export const FORWARDED_POINTER_TRACK_SCHEMA = z.object({
 	events: POINTER_EVENTS,
 	/** When each take of the session started, by its video path. */
 	takes: z.record(z.string(), z.number()),
+	/** The client's own start time, for a video no take of the session recorded. */
+	recordingStartedAt: z.number().optional(),
 });
 
 /**
  * setPointerTrack's change: the new sidecar, and the zooms planned on its clicks. Computed
- * by the runner's process (the app's, when it runs), and written by that runner.
+ * by the runner's process (the app's, when it runs), and written by that runner. The video's
+ * start is the client's `recordingStartedAt` when it gave one, else its take's in `takes`.
  */
 export async function pointerTrackEdit(
 	document: AxcutDocument,
 	events: PointerEvent[],
 	takes: Readonly<Record<string, number>>,
+	recordingStartedAt?: number,
 ): ReturnType<RunnerEdit> {
 	const asset = document.assets.find((a) => a.id === document.project.primaryAssetId);
-	const startedAt = asset ? takes[asset.originalPath] : undefined;
-	if (!asset || startedAt === undefined || !asset.durationSec) {
+	if (!asset?.durationSec) {
+		return { ok: false, resultJson: "This project has no video to give a pointer to." };
+	}
+	const startedAt = recordingStartedAt ?? takes[asset.originalPath];
+	if (startedAt === undefined) {
 		return {
 			ok: false,
 			resultJson:
-				"This project's take was not recorded by this server, so its start time is unknown. setPointerTrack only works on a take from stopRecording.",
+				"This project's video was not recorded by this server, so its start time is unknown. Pass recordingStartedAt: when the video's first frame was captured, on the clock of the events' `at`.",
 		};
 	}
 	const samples = pointerSamples(events, startedAt, asset.durationSec * 1000);
@@ -498,6 +519,10 @@ function runnerRecorder(deps: MediaToolDeps): TakeRecorder {
 					if (!result.success || !result.screenVideoPath) {
 						throw new Error(`The recording failed: ${result.error ?? "unknown error"}`);
 					}
+					const warnings = [
+						...(result.warnings ?? []),
+						...(request.camera && !result.webcamVideoPath ? [NO_WEBCAM_PICTURE] : []),
+					];
 					try {
 						const project = await createProjectFromVideo(
 							deps,
@@ -512,7 +537,7 @@ function runnerRecorder(deps: MediaToolDeps): TakeRecorder {
 							videoPath: result.screenVideoPath,
 							durationSec: project.durationSec,
 							autoZooms: project.autoZooms,
-							...(result.warnings?.length ? { warnings: result.warnings } : {}),
+							...(warnings.length ? { warnings } : {}),
 						};
 					} catch (error) {
 						// The take is on disk all the same: say where, so it can still be looked at.
@@ -540,6 +565,8 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 	// A take and an export never run together: each is a heavy job of its own, and a
 	// take's capture must not lose frames to an export.
 	let exporting = false;
+	// Standalone project creation remains active through asset import and checkpoint save.
+	let projectOperations = 0;
 	/** When each take of this session started, by its video: setPointerTrack's clock. */
 	const startedAtByVideo = new Map<string, number>();
 	/** Each project's last export of this session, and when it was made: what getFrames reads. */
@@ -623,7 +650,15 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 		} catch (error) {
 			return text(error instanceof Error ? error.message : String(error), true);
 		}
-		startedAtByVideo.set(recorded.videoPath, running.startedAt);
+		return recordingResult(recorded, running.startedAt);
+	}
+
+	/** Also the one place a take's start is kept, so setPointerTrack finds a waited-for take. */
+	async function recordingResult(
+		recorded: RecordedTake,
+		recordingStartedAt: number,
+	): Promise<CallToolResult> {
+		startedAtByVideo.set(recorded.videoPath, recordingStartedAt);
 		const { projectId } = recorded;
 		return text(
 			JSON.stringify({
@@ -631,7 +666,7 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 				checkpointId: await checkpointOf(projectId),
 				videoPath: recorded.videoPath,
 				durationSec: recorded.durationSec,
-				recordingStartedAt: running.startedAt,
+				recordingStartedAt,
 				autoZooms: recorded.autoZooms,
 				...(recorded.warnings?.length ? { warnings: recorded.warnings } : {}),
 			}),
@@ -692,7 +727,7 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 						.union([z.boolean(), z.string()])
 						.optional()
 						.describe(
-							"Also record the webcam: true for the default camera, or part of a camera's name.",
+							"Also record the webcam: true for the camera the user picked in OpenScreen, or part of a camera's name.",
 						),
 					cursor: z
 						.enum(["editable-overlay", "system"])
@@ -705,6 +740,7 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 			},
 			async (args) => {
 				if (!deps.editsAllowed()) return text(GATED_MESSAGE, true);
+				if (take?.running && !take.stopping && deps.recordingActive?.() === false) take = null;
 				if (take?.stopping) {
 					return text("The last take is still being saved. Try again in a moment.", true);
 				}
@@ -767,13 +803,65 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 		);
 
 		server.registerTool(
+			"waitForRecording",
+			{
+				description:
+					"Wait for the current recording in the OpenScreen app to finish and its project to be saved, including a take started by the user at the recording bar. Never starts or stops a recording. Binds to this take only, including while it saves; returns an error immediately if none is active. Returns the same recording fields as stopRecording. Timeout or request cancellation only ends the wait. Available on the in-app HTTP server; openscreen mcp cannot observe the app's recording bar.",
+				inputSchema: z.object({
+					timeoutSec: z
+						.number()
+						.int()
+						.min(1)
+						.max(3600)
+						.default(300)
+						.describe(
+							"Maximum seconds to wait, including saving (1–3600, default 300). Set the client's tool-call timeout longer than this.",
+						),
+				}),
+				annotations: READ_ONLY,
+			},
+			async ({ timeoutSec }, { signal }) => {
+				if (!deps.waitForRecording)
+					return text(
+						"waitForRecording requires the in-app HTTP MCP server. Connect to it to observe the user's recording.",
+						true,
+					);
+				const observedTake = take;
+				try {
+					const recorded = await deps.waitForRecording(timeoutSec * 1000, signal);
+					return recordingResult(recorded, recorded.recordingStartedAt);
+				} catch (error) {
+					return text(error instanceof Error ? error.message : String(error), true);
+				} finally {
+					// A take still starting keeps its claim: only a running one can have finished.
+					if (
+						take === observedTake &&
+						take?.running &&
+						!take.stopping &&
+						deps.recordingActive?.() === false
+					)
+						take = null;
+				}
+			},
+		);
+
+		server.registerTool(
 			"setPointerTrack",
 			{
 				description: [
-					"For a take driven by a script (Playwright, CDP, a browser extension) rather than the real mouse: the screen pointer never moved, so the video has no cursor and no zoom. Give the pointer's path here and OpenScreen draws it, gliding between your actions, and zooms on its clicks as for a real mouse. It replaces the pointer recorded with the take, then plans zooms on the new clicks as stopRecording does, clear of the zooms already there; autoZoomsAdded says how many. Only for a take recorded by this server. It is an edit like any other: on a project that is not open in the editor it needs a checkpoint (stopRecording made one), and restoreCheckpoint undoes it, the pointer track included.",
+					"For a video driven by a script (Playwright, CDP, a browser extension) rather than the real mouse: the screen pointer never moved, so the video has no cursor and no zoom. Give the pointer's path here and OpenScreen draws it, gliding between your actions, and zooms on its clicks as for a real mouse. It replaces the pointer recorded with the video, saved beside it as <video>.cursor.json, then plans zooms on the new clicks as stopRecording does, clear of the zooms already there; autoZoomsAdded says how many. A take from stopRecording knows when it started; a video given to createProject needs recordingStartedAt. It is an edit like any other: on a project that is not open in the editor it needs a checkpoint (stopRecording and createProject make one), and restoreCheckpoint undoes it, the pointer track included.",
 					"events, one per action: `at` is Date.now() when your script did it (log it as it runs; the take's recordingStartedAt is on the same clock). `x` and `y` are fractions (0 to 1) of the recorded window. For a point (clientX, clientY) of a page shown in that window, from inside the page: border = (outerWidth - innerWidth) / 2; x = (border + clientX) / outerWidth; y = (outerHeight - innerHeight - border + clientY) / outerHeight.",
 				].join("\n"),
-				inputSchema: z.object({ projectId: z.string(), events: POINTER_EVENTS }),
+				inputSchema: z.object({
+					projectId: z.string(),
+					events: POINTER_EVENTS,
+					recordingStartedAt: z
+						.number()
+						.optional()
+						.describe(
+							"When the video's first frame was captured, on the clock of the events' `at`: needed for a video this server did not record, such as one given to createProject. A take from stopRecording defaults to its own. For a video captured frame by frame, pass 0 and give each `at` as milliseconds into the video.",
+						),
+				}),
 				annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
 			},
 			// Through the document tools' runner, like any edit: the same queue, the same refusals
@@ -783,10 +871,11 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 			// (app-channel.ts).
 			(args) => {
 				const takes = Object.fromEntries(startedAtByVideo);
+				const { projectId, events, recordingStartedAt } = args;
 				return deps.runTool(
 					POINTER_TRACK_TOOL,
-					{ projectId: args.projectId, events: args.events, takes },
-					{ edit: (document) => pointerTrackEdit(document, args.events, takes) },
+					{ projectId, events, takes, recordingStartedAt },
+					{ edit: (document) => pointerTrackEdit(document, events, takes, recordingStartedAt) },
 				);
 			},
 		);
@@ -1123,51 +1212,60 @@ export function createMediaTools(deps: MediaToolDeps): MediaTools {
 						true,
 					);
 				}
-				const title = args.title?.trim();
-				if (args.videoPath === undefined) {
-					let projectId: string;
+				projectOperations += 1;
+				try {
+					const title = args.title?.trim();
+					if (args.videoPath === undefined) {
+						let projectId: string;
+						try {
+							projectId = (await deps.documents.createProject(title ?? "")).project.id;
+						} catch (error) {
+							return text(
+								`No project was created: ${error instanceof Error ? error.message : String(error)}`,
+								true,
+							);
+						}
+						return text(JSON.stringify({ projectId, checkpointId: await checkpointOf(projectId) }));
+					}
+					const videoPath = args.videoPath;
+					const problem = await mediaPathProblem(videoPath, "video");
+					if (problem) return text(problem, true);
+					let project: Awaited<ReturnType<typeof createProjectFromVideo>>;
 					try {
-						projectId = (await deps.documents.createProject(title ?? "")).project.id;
+						project = await createProjectFromVideo(
+							deps,
+							videoPath,
+							title || path.parse(videoPath).name,
+							// A video from elsewhere: no webcam recorded beside it here.
+							null,
+						);
 					} catch (error) {
 						return text(
 							`No project was created: ${error instanceof Error ? error.message : String(error)}`,
 							true,
 						);
 					}
-					return text(JSON.stringify({ projectId, checkpointId: await checkpointOf(projectId) }));
-				}
-				const videoPath = args.videoPath;
-				const problem = await mediaPathProblem(videoPath, "video");
-				if (problem) return text(problem, true);
-				let project: Awaited<ReturnType<typeof createProjectFromVideo>>;
-				try {
-					project = await createProjectFromVideo(
-						deps,
-						videoPath,
-						title || path.parse(videoPath).name,
-						// A video from elsewhere: no webcam recorded beside it here.
-						null,
-					);
-				} catch (error) {
+					const projectId = project.document.project.id;
 					return text(
-						`No project was created: ${error instanceof Error ? error.message : String(error)}`,
-						true,
+						JSON.stringify({
+							projectId,
+							checkpointId: await checkpointOf(projectId),
+							durationSec: project.durationSec,
+							autoZooms: project.autoZooms,
+						}),
 					);
+				} finally {
+					projectOperations -= 1;
 				}
-				const projectId = project.document.project.id;
-				return text(
-					JSON.stringify({
-						projectId,
-						checkpointId: await checkpointOf(projectId),
-						durationSec: project.durationSec,
-						autoZooms: project.autoZooms,
-					}),
-				);
 			},
 		);
 	}
 
-	return { preamble: mediaPreamble(transport), register };
+	return {
+		preamble: mediaPreamble(transport),
+		isBusy: () => take !== null || exporting || projectOperations > 0,
+		register,
+	};
 }
 
 /**

@@ -501,6 +501,296 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		expect(bridgeMocks.save).not.toHaveBeenCalled();
 	});
 
+	// #1610: a long fragmented-MP4 take outlasted the 5 s probe, and that one failure was final
+	// for the session, so the editor stretched the picture. The backfill waits longer and
+	// tries again on a later document change.
+	it("waits longer than an insert probe and retries a failed probe on a later change", async () => {
+		probeVideoDimensionsMock.mockResolvedValueOnce(null);
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		expect(probeVideoDimensionsMock.mock.calls[0][1]).toBeGreaterThanOrEqual(60_000);
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+		});
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+
+		act(() => {
+			useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision: 2 });
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2);
+		const saved = useProjectStore.getState().document?.assets.find((a) => a.id === "asset_1");
+		expect(saved?.video).toMatchObject({ width: 1920, height: 1080 });
+	});
+
+	it("stops probing an unreadable file after a bounded number of attempts", async () => {
+		probeVideoDimensionsMock.mockResolvedValue(null);
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		for (let revision = 2; revision < 8; revision++) {
+			await act(async () => {
+				await new Promise((r) => setTimeout(r, 0));
+			});
+			act(() => {
+				useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision });
+			});
+		}
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+		});
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(3);
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+	});
+
+	// A successful probe whose save was deferred is not a failure: it must not use up the
+	// attempts, or a busy save queue would end the backfill for the session.
+	it("keeps retrying a successful probe whose save keeps timing out", async () => {
+		for (let i = 0; i < 3; i++) waitForDocumentSavesMock.mockResolvedValueOnce("timeout");
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		for (let revision = 2; revision < 5; revision++) {
+			await waitFor(() => expect(waitForDocumentSavesMock).toHaveBeenCalledTimes(revision - 1));
+			await act(async () => {
+				await new Promise((r) => setTimeout(r, 0));
+			});
+			act(() => {
+				useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision });
+			});
+		}
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(4);
+	});
+
+	it("retries a successful probe whose save failed on a later change", async () => {
+		bridgeMocks.save.mockResolvedValueOnce({ success: false, error: "disk full" });
+		const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: unprobed,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+		});
+		act(() => {
+			useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision: 2 });
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		const saved = useProjectStore.getState().document?.assets.find((a) => a.id === "asset_1");
+		expect(saved?.video).toMatchObject({ width: 1920, height: 1080 });
+	});
+
+	// A save that never settles must not hold the batch chain, or the asset stays reserved and
+	// no later change ever probes it again.
+	it("releases a batch whose save never settles once the deadline passes", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		let settleHungSave!: () => void;
+		try {
+			bridgeMocks.save.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						settleHungSave = () => resolve({ success: false, error: "hung" });
+					}),
+			);
+			const unprobed = { ...sampleDoc, assets: [{ ...sampleDoc.assets[0], video: undefined }] };
+			useProjectStore.setState({
+				projectId: "proj_test",
+				document: unprobed,
+				revision: 1,
+				status: "ready",
+				error: null,
+			});
+			renderTimeline();
+			await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(10_000);
+			});
+			act(() => {
+				useProjectStore.setState({ document: { ...unprobed, zoomRanges: [] }, revision: 2 });
+			});
+			await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+			// Settle it so the store's in-flight count does not leak into the next test.
+			await act(async () => {
+				settleHungSave();
+				await vi.advanceTimersByTimeAsync(0);
+			});
+			await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// A run started while an earlier asset is still probing must not take a later asset of
+	// the first batch: it would be probed twice.
+	it("does not probe a queued asset again from a run started while the batch is out", async () => {
+		let resolveFirst!: (dims: { width: number; height: number }) => void;
+		probeVideoDimensionsMock.mockImplementation((url: string) =>
+			url.includes("first")
+				? new Promise((resolve) => {
+						resolveFirst = resolve;
+					})
+				: Promise.resolve({ width: 1280, height: 720 }),
+		);
+		const first = { ...sampleDoc.assets[0], originalPath: "/tmp/first.webm", video: undefined };
+		const second = {
+			...sampleDoc.assets[0],
+			id: "asset_2",
+			originalPath: "/tmp/second.webm",
+			video: undefined,
+		};
+		const twoAssets: AxcutDocument = {
+			...sampleDoc,
+			assets: [first, second],
+			timeline: {
+				...sampleDoc.timeline,
+				clips: [
+					...sampleDoc.timeline.clips,
+					{ ...sampleDoc.timeline.clips[0], id: "clip_b", assetId: "asset_2" },
+				],
+			},
+		};
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: twoAssets,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		act(() => {
+			useProjectStore.setState({ document: { ...twoAssets, zoomRanges: [] }, revision: 2 });
+		});
+		await act(async () => {
+			resolveFirst({ width: 1920, height: 1080 });
+			await new Promise((r) => setTimeout(r, 0));
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const secondCalls = probeVideoDimensionsMock.mock.calls.filter(([url]) =>
+			String(url).includes("second"),
+		);
+		expect(secondCalls).toHaveLength(1);
+	});
+
+	// toFileUrl throws on a path it cannot encode. That must count as one failed probe, not
+	// strand the batch: the readable asset after it still gets its dims saved.
+	it("still saves the rest of the batch when one path cannot be turned into a URL", async () => {
+		const broken = {
+			...sampleDoc.assets[0],
+			originalPath: "/tmp/bad\uD800.webm",
+			video: undefined,
+		};
+		const readable = {
+			...sampleDoc.assets[0],
+			id: "asset_2",
+			originalPath: "/tmp/readable.webm",
+			video: undefined,
+		};
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: {
+				...sampleDoc,
+				assets: [broken, readable],
+				timeline: {
+					...sampleDoc.timeline,
+					clips: [
+						...sampleDoc.timeline.clips,
+						{ ...sampleDoc.timeline.clips[0], id: "clip_b", assetId: "asset_2" },
+					],
+				},
+			},
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const assets = useProjectStore.getState().document?.assets;
+		expect(assets?.find((a) => a.id === "asset_2")?.video).toMatchObject({ width: 1920 });
+		expect(assets?.find((a) => a.id === "asset_1")?.video).toBeUndefined();
+	});
+
+	// Two batches that wait on the same save must not both build on the same document: the
+	// second save would drop the first one's dimensions while that asset stays marked probed.
+	it("keeps both batches' dimensions when their saves would overlap", async () => {
+		let releaseSaves!: () => void;
+		const saves = new Promise<"drained">((resolve) => {
+			releaseSaves = () => resolve("drained");
+		});
+		waitForDocumentSavesMock.mockImplementationOnce(() => saves);
+		waitForDocumentSavesMock.mockImplementationOnce(() => saves);
+		const second = {
+			...sampleDoc.assets[0],
+			id: "asset_2",
+			originalPath: "/tmp/second.webm",
+			video: undefined,
+		};
+		const doc: AxcutDocument = {
+			...sampleDoc,
+			assets: [{ ...sampleDoc.assets[0], video: undefined }, second],
+		};
+		useProjectStore.setState({
+			projectId: "proj_test",
+			document: doc,
+			revision: 1,
+			status: "ready",
+			error: null,
+		});
+		renderTimeline();
+		await waitFor(() => expect(waitForDocumentSavesMock).toHaveBeenCalledTimes(1));
+		// asset_2 enters the timeline while the first batch waits: a second batch probes it.
+		act(() => {
+			useProjectStore.setState({
+				document: {
+					...doc,
+					timeline: {
+						...doc.timeline,
+						clips: [
+							...doc.timeline.clips,
+							{ ...doc.timeline.clips[0], id: "clip_b", assetId: "asset_2" },
+						],
+					},
+				},
+				revision: 2,
+			});
+		});
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+			releaseSaves();
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		const assets = useProjectStore.getState().document?.assets;
+		expect(assets?.find((a) => a.id === "asset_1")?.video).toMatchObject({ width: 1920 });
+		expect(assets?.find((a) => a.id === "asset_2")?.video).toMatchObject({ width: 1920 });
+	});
+
 	it("does not re-probe a used asset with no reachable file more than once", async () => {
 		probeVideoDimensionsMock.mockResolvedValue(null); // probe fails (unreadable file)
 		useProjectStore.setState({
@@ -662,6 +952,297 @@ describe("useTimeline.applyClipEdit (Edit-clip modal)", () => {
 			await result.current.applyClipEdit("clip_a", 0, 6, null);
 		});
 		expect(useProjectStore.getState().document?.timeline.clips[0].cropRegion).toBeUndefined();
+	});
+
+	it("sets, keeps and removes the rotation in one save each", async () => {
+		const { result } = renderTimeline();
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 6, undefined, 180);
+		});
+		expect(useProjectStore.getState().document?.timeline.clips[0].rotation).toBe(180);
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 6);
+		});
+		expect(useProjectStore.getState().document?.timeline.clips[0].rotation).toBe(180);
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 6, undefined, 0);
+		});
+		expect(useProjectStore.getState().document?.timeline.clips[0]).not.toHaveProperty("rotation");
+	});
+
+	// A stored zoom focus is where the viewer sees it: turning the clip moves that content to
+	// the mirrored point, so the clip's own zooms must follow it.
+	it("mirrors the focus of the turned clip's zooms in the same save, and only those", async () => {
+		// Not contiguous in the source with clip_a, or the two would merge into one clip.
+		const clipB = {
+			...sampleDoc.timeline.clips[0],
+			id: "clip_b",
+			sourceStartSec: 15,
+			sourceEndSec: 25,
+			timelineStartSec: 10,
+			timelineEndSec: 20,
+		};
+		const zoomA = { ...anchoredZoom("z_a", 2, 3), focus: { cx: 0.2, cy: 0.75 } };
+		const zoomB = {
+			...anchoredZoom("z_b", 17, 18),
+			startMs: 12000,
+			endMs: 13000,
+			clipId: "clip_b",
+			focus: { cx: 0.2, cy: 0.75 },
+		};
+		useProjectStore.setState({
+			document: {
+				...sampleDoc,
+				timeline: { ...sampleDoc.timeline, clips: [sampleDoc.timeline.clips[0], clipB] },
+				zoomRanges: [zoomA, zoomB],
+			},
+		});
+		const focusOf = (id: string) =>
+			useProjectStore.getState().document?.zoomRanges.find((z) => z.id === id)?.focus;
+		const { result } = renderTimeline();
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 180);
+		});
+		expect(focusOf("z_a")?.cx).toBeCloseTo(0.8, 9);
+		expect(focusOf("z_a")?.cy).toBeCloseTo(0.25, 9);
+		expect(focusOf("z_b")).toEqual({ cx: 0.2, cy: 0.75 });
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+
+		// Unchanged rotation: no mirroring.
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 180);
+		});
+		expect(focusOf("z_a")?.cx).toBeCloseTo(0.8, 9);
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 0);
+		});
+		expect(focusOf("z_a")?.cx).toBeCloseTo(0.2, 9);
+		expect(focusOf("z_a")?.cy).toBeCloseTo(0.75, 9);
+		expect(focusOf("z_b")).toEqual({ cx: 0.2, cy: 0.75 });
+	});
+
+	// A footage-space privacy blur must stay on what it hides: turning the clip moves that
+	// content to the mirrored box. Frame-space annotations and other types do not turn.
+	it("mirrors the turned clip's footage-space blurs in the same save, and only those", async () => {
+		const clipB = {
+			...sampleDoc.timeline.clips[0],
+			id: "clip_b",
+			sourceStartSec: 15,
+			sourceEndSec: 25,
+			timelineStartSec: 10,
+			timelineEndSec: 20,
+		};
+		const annotation = (
+			id: string,
+			clipId: string,
+			type: "blur" | "text",
+			space?: "frame",
+		): AxcutDocument["annotations"][number] => ({
+			id,
+			startMs: clipId === "clip_a" ? 2000 : 12000,
+			endMs: clipId === "clip_a" ? 3000 : 13000,
+			clipId,
+			sourceStartSec: clipId === "clip_a" ? 2 : 17,
+			sourceEndSec: clipId === "clip_a" ? 3 : 18,
+			type,
+			content: "",
+			...(space ? { space } : {}),
+			position: { x: 10, y: 20 },
+			size: { width: 30, height: 15 },
+			style: {
+				color: "#ffffff",
+				backgroundColor: "transparent",
+				fontSize: 32,
+				fontFamily: "Inter",
+				fontWeight: "bold",
+				fontStyle: "normal",
+				textDecoration: "none",
+				textAlign: "center",
+				textAnimation: "none",
+			},
+			zIndex: 1,
+		});
+		useProjectStore.setState({
+			document: {
+				...sampleDoc,
+				timeline: { ...sampleDoc.timeline, clips: [sampleDoc.timeline.clips[0], clipB] },
+				zoomRanges: [],
+				annotations: [
+					annotation("blur_a", "clip_a", "blur"),
+					annotation("blur_frame", "clip_a", "blur", "frame"),
+					annotation("text_a", "clip_a", "text"),
+					annotation("blur_b", "clip_b", "blur"),
+				],
+			},
+		});
+		const boxOf = (id: string) => {
+			const a = useProjectStore.getState().document?.annotations.find((r) => r.id === id);
+			return { position: a?.position, size: a?.size };
+		};
+		const untouched = { position: { x: 10, y: 20 }, size: { width: 30, height: 15 } };
+		const { result } = renderTimeline();
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 180);
+		});
+		expect(boxOf("blur_a").position?.x).toBeCloseTo(60, 9);
+		expect(boxOf("blur_a").position?.y).toBeCloseTo(65, 9);
+		expect(boxOf("blur_a").size).toEqual({ width: 30, height: 15 });
+		expect(boxOf("blur_frame")).toEqual(untouched);
+		expect(boxOf("text_a")).toEqual(untouched);
+		expect(boxOf("blur_b")).toEqual(untouched);
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+
+		// Unchanged rotation: no mirroring.
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 180);
+		});
+		expect(boxOf("blur_a").position?.x).toBeCloseTo(60, 9);
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 0);
+		});
+		expect(boxOf("blur_a").position?.x).toBeCloseTo(10, 9);
+		expect(boxOf("blur_a").position?.y).toBeCloseTo(20, 9);
+		expect(boxOf("blur_b")).toEqual(untouched);
+	});
+
+	it("keeps a blur flush against the far edge at 0 when the clip turns", async () => {
+		// 100 - 89.9 - 10.1 is -5.3e-15 in floating point; a blur below 0 fails the schema.
+		const doc = useProjectStore.getState().document as AxcutDocument;
+		const blur: AxcutDocument["annotations"][number] = {
+			id: "blur_edge",
+			startMs: 2000,
+			endMs: 3000,
+			clipId: "clip_a",
+			sourceStartSec: 2,
+			sourceEndSec: 3,
+			type: "blur",
+			content: "",
+			position: { x: 89.9, y: 89.9 },
+			size: { width: 10.1, height: 10.1 },
+			style: {
+				color: "#ffffff",
+				backgroundColor: "transparent",
+				fontSize: 32,
+				fontFamily: "Inter",
+				fontWeight: "bold",
+				fontStyle: "normal",
+				textDecoration: "none",
+				textAlign: "center",
+				textAnimation: "none",
+			},
+			zIndex: 1,
+		};
+		useProjectStore.setState({ document: { ...doc, annotations: [blur] } });
+		const { result } = renderTimeline();
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 180);
+		});
+		const saved = useProjectStore.getState().document?.annotations[0];
+		expect(saved?.position).toEqual({ x: 0, y: 0 });
+	});
+
+	// The outline of a freehand blur turns with its box, or the mosaic lands next to what it
+	// was drawn over and that content shows in the clear.
+	it("mirrors a turned freehand blur's outline with its box", async () => {
+		const doc = useProjectStore.getState().document as AxcutDocument;
+		const blur: AxcutDocument["annotations"][number] = {
+			id: "blur_freehand",
+			startMs: 2000,
+			endMs: 3000,
+			clipId: "clip_a",
+			sourceStartSec: 2,
+			sourceEndSec: 3,
+			type: "blur",
+			content: "",
+			position: { x: 10, y: 20 },
+			size: { width: 30, height: 15 },
+			style: {
+				color: "#ffffff",
+				backgroundColor: "transparent",
+				fontSize: 32,
+				fontFamily: "Inter",
+				fontWeight: "bold",
+				fontStyle: "normal",
+				textDecoration: "none",
+				textAlign: "center",
+				textAnimation: "none",
+			},
+			zIndex: 1,
+			blurData: {
+				type: "mosaic",
+				shape: "freehand",
+				color: "black",
+				intensity: 12,
+				blockSize: 20,
+				freehandPoints: [
+					{ x: 0, y: 10 },
+					{ x: 75, y: 0 },
+					{ x: 100, y: 90 },
+				],
+			},
+		};
+		useProjectStore.setState({ document: { ...doc, annotations: [blur] } });
+		const { result } = renderTimeline();
+		const saved = () => useProjectStore.getState().document?.annotations[0];
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 180);
+		});
+		expect(saved()?.blurData?.freehandPoints).toEqual([
+			{ x: 100, y: 90 },
+			{ x: 25, y: 100 },
+			{ x: 0, y: 10 },
+		]);
+		expect(saved()?.blurData).toMatchObject({ shape: "freehand", color: "black", blockSize: 20 });
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_a", 0, 10, undefined, 0);
+		});
+		expect(saved()?.blurData?.freehandPoints).toEqual(blur.blurData?.freehandPoints);
+	});
+
+	// Trimming a clip so its media meets an upright neighbour and turning it in the same Apply
+	// must leave two clips: the join may only see the clip as it is after the edit.
+	it("keeps the rotation when the same Apply makes the clip's media meet a neighbour", async () => {
+		const clipA = {
+			...sampleDoc.timeline.clips[0],
+			sourceStartSec: 0,
+			sourceEndSec: 10,
+			timelineStartSec: 0,
+			timelineEndSec: 10,
+		};
+		const clipB = {
+			...clipA,
+			id: "clip_b",
+			sourceStartSec: 12,
+			sourceEndSec: 20,
+			timelineStartSec: 10,
+			timelineEndSec: 18,
+		};
+		const doc = useProjectStore.getState().document as AxcutDocument;
+		useProjectStore.setState({
+			document: {
+				...doc,
+				timeline: { ...doc.timeline, clips: [clipA, clipB] },
+				zoomRanges: [],
+			},
+		});
+		const { result } = renderTimeline();
+
+		await act(async () => {
+			await result.current.applyClipEdit("clip_b", 10, 20, undefined, 180);
+		});
+		const clips = useProjectStore.getState().document?.timeline.clips;
+		expect(clips?.map((c) => [c.id, c.sourceStartSec, c.sourceEndSec, c.rotation])).toEqual([
+			["clip_a", 0, 10, undefined],
+			["clip_b", 10, 20, 180],
+		]);
 	});
 });
 
@@ -2695,6 +3276,49 @@ describe("useTimeline audio tracks", () => {
 		});
 		const track = useProjectStore.getState().document?.audioTracks[0];
 		expect(track).toMatchObject({ startMs: 9000, endMs: 10_000 });
+	});
+
+	it("preserves the requested music tail when a UI body drag also carries its offset", async () => {
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1", 0)) ?? "";
+		});
+		await act(async () => {
+			await result.current.placeAudioTrack(id, {
+				startMs: 5000,
+				endMs: 15_000,
+				offsetMs: 0,
+				mode: "move",
+			});
+		});
+		expect(useProjectStore.getState().document?.audioTracks[0]).toMatchObject({
+			startMs: 5000,
+			endMs: 10_000,
+			endOverflowMs: 25_000,
+		});
+	});
+
+	it("slips the source without clearing the retained tail or moving the pill", async () => {
+		const { result } = renderTimeline();
+		let id = "";
+		await act(async () => {
+			id = (await result.current.addAudioTrack("audio_1", 0, { spanSec: 20 })) ?? "";
+		});
+		await act(async () => {
+			await result.current.placeAudioTrack(id, {
+				startMs: 0,
+				endMs: 10_000,
+				offsetMs: 5000,
+				mode: "slip",
+			});
+		});
+		expect(useProjectStore.getState().document?.audioTracks[0]).toMatchObject({
+			startMs: 0,
+			endMs: 10_000,
+			offsetMs: 5000,
+			endOverflowMs: 10_000,
+		});
 	});
 
 	it("turning loop on fills the rest of the programme, in one undo step", async () => {

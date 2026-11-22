@@ -15,6 +15,7 @@ import { useScopedT } from "@/contexts/I18nContext";
 import type { LayoutPreset } from "../../layoutTypes";
 import { DEFAULT_TEXT_PLATE } from "../annotations/background";
 import { fitTextBox } from "../annotations/placement";
+import { type ClipRotation, clipRotation } from "../clipRotation";
 import {
 	collapseTracksToPills,
 	patchAudioTrack,
@@ -87,6 +88,13 @@ import { useSequentialTimelineOps } from "./useSequentialTimelineOps";
 // Every other entry point — keyboard shortcuts, the agent, auto-zooms — gets
 // these 2 s, which is what all five add* used to hardcode.
 const DEFAULT_NEW_REGION_SEC = 2;
+
+// The on-load dimension backfill runs in the background, so it can wait far longer than an
+// insert's 5 s probe. It has to: the Linux recorder writes fragmented MP4 with no index, and
+// Chromium walks every fragment before `loadedmetadata`, which takes well past 5 s on a long
+// take (#1610). A failure is retried on a later document change, a bounded number of times.
+const DIMS_PROBE_TIMEOUT_MS = 60_000;
+const DIMS_PROBE_ATTEMPTS = 3;
 
 // NaN-guarded floors. Timeline inputs arrive from drag deltas and persisted
 // documents, both of which can carry NaN; every action needs the same guard.
@@ -256,10 +264,14 @@ export function useTimeline() {
 	// cropped clip could show under ORIGINAL while an un-probed 16:9 sibling was missing entirely.
 	// Probe once on load and persist via saveDocument with `history: false` (a write the user
 	// never made must not be what the next Ctrl+Z reverses), so the fix sticks and every consumer
-	// agrees without each re-probing on its own (what the export dialog used to do). Attempt each
-	// asset at most once per session, even on failure, so a file that can't be probed doesn't
-	// spin the effect on every document change.
+	// agrees without each re-probing on its own (what the export dialog used to do). A failed
+	// probe is tried again on a later document change, up to DIMS_PROBE_ATTEMPTS per session, so
+	// one slow open is not final (#1610) and an unreadable file still doesn't spin the effect.
 	const probedAssetIdsRef = useRef<Set<string>>(new Set());
+	const dimsProbeAttemptsRef = useRef<Map<string, number>>(new Map());
+	// Batches write one after another: two that waited on the same save would each re-read the
+	// same document, and the second save would drop the first one's dimensions.
+	const dimsWriteRef = useRef<Promise<void>>(Promise.resolve());
 	useEffect(() => {
 		if (!document) return;
 		const usedAssetIds = new Set(document.timeline.clips.map((c) => c.assetId));
@@ -277,7 +289,8 @@ export function useTimeline() {
 			(a) =>
 				usedAssetIds.has(a.id) &&
 				(needsScreen(a) || needsCamera(a)) &&
-				!probedAssetIdsRef.current.has(a.id),
+				!probedAssetIdsRef.current.has(a.id) &&
+				(dimsProbeAttemptsRef.current.get(a.id) ?? 0) < DIMS_PROBE_ATTEMPTS,
 		);
 		if (missing.length === 0) return;
 		// No cleanup cancels this. The effect re-runs on EVERY document change, and a fresh
@@ -290,54 +303,86 @@ export function useTimeline() {
 		void (async () => {
 			type Dims = { width: number; height: number };
 			const probed: Record<string, { video?: Dims; camera?: Dims }> = {};
+			// Reserve the whole batch before the first await: a run triggered while an earlier
+			// asset is still probing must not pick up a later one and probe it twice.
+			for (const a of missing) probedAssetIdsRef.current.add(a.id);
+			// A path toFileUrl cannot encode (a lone surrogate throws) is a failed probe, not a
+			// throw that skips the cleanup below and strands the whole reserved batch.
+			const probe = async (path: string) => {
+				try {
+					return await probeVideoDimensions(toFileUrl(path), DIMS_PROBE_TIMEOUT_MS);
+				} catch {
+					return null;
+				}
+			};
 			for (const a of missing) {
-				probedAssetIdsRef.current.add(a.id);
 				const entry: { video?: Dims; camera?: Dims } = {};
+				let failed = false;
 				if (needsScreen(a)) {
-					const dims = await probeVideoDimensions(toFileUrl(a.originalPath));
+					const dims = await probe(a.originalPath);
 					if (dims) entry.video = dims;
+					else failed = true;
 				}
 				// Probed independently of the screen: one file being unreadable must not cost
 				// the other its dimensions, and a camera-less asset simply skips this.
 				if (a.cameraTrack && needsCamera(a)) {
-					const dims = await probeVideoDimensions(toFileUrl(a.cameraTrack.sourcePath));
+					const dims = await probe(a.cameraTrack.sourcePath);
 					if (dims) entry.camera = dims;
+					else failed = true;
 				}
 				if (entry.video || entry.camera) probed[a.id] = entry;
+				// Unmarked so a later document change retries what is still missing. Only a failed
+				// probe counts toward the limit: a save deferred below must stay retryable.
+				if (failed) {
+					probedAssetIdsRef.current.delete(a.id);
+					dimsProbeAttemptsRef.current.set(a.id, (dimsProbeAttemptsRef.current.get(a.id) ?? 0) + 1);
+				}
 			}
 			if (Object.keys(probed).length === 0) return;
-			// The store only takes a document once its save returns, so a write still in flight
-			// (the fresh-recording auto-zooms, typically) is invisible here. Building on the store
-			// before it lands and saving after it would erase it. Wait it out; on a timeout,
-			// write nothing and let a later run probe again.
-			if ((await waitForDocumentSaves()) === "timeout") {
-				for (const id of Object.keys(probed)) probedAssetIdsRef.current.delete(id);
-				return;
-			}
-			// Re-read fresh state so a concurrent edit made while probing isn't stomped.
-			const current = useProjectStore.getState().document;
-			if (!current || current.project.id !== originatingProjectId) return;
-			// `history: false` — see the comment above: a backfill nobody asked for must
-			// not become the thing the next Ctrl+Z reverses.
-			await useProjectStore.getState().saveDocument(
-				{
-					...current,
-					assets: current.assets.map((a) => {
-						const found = probed[a.id];
-						if (!found) return a;
-						return {
-							...a,
-							...(found.video
-								? { video: { codec: "unknown", fps: 0, ...a.video, ...found.video } }
-								: {}),
-							...(found.camera && a.cameraTrack
-								? { cameraTrack: { ...a.cameraTrack, ...found.camera } }
-								: {}),
-						};
-					}),
-				},
-				{ history: false },
-			);
+			dimsWriteRef.current = dimsWriteRef.current
+				.then(async () => {
+					// The store only takes a document once its save returns, so a write still in flight
+					// (the fresh-recording auto-zooms, typically) is invisible here. Building on the store
+					// before it lands and saving after it would erase it. Wait it out; on a timeout,
+					// write nothing and let a later run probe again.
+					if ((await waitForDocumentSaves()) === "timeout") {
+						for (const id of Object.keys(probed)) probedAssetIdsRef.current.delete(id);
+						return;
+					}
+					// Re-read fresh state so a concurrent edit made while probing isn't stomped.
+					const current = useProjectStore.getState().document;
+					if (!current || current.project.id !== originatingProjectId) return;
+					// `history: false` — see the comment above: a backfill nobody asked for must
+					// not become the thing the next Ctrl+Z reverses.
+					const saved = await saveWithDeadline(
+						useProjectStore.getState().saveDocument(
+							{
+								...current,
+								assets: current.assets.map((a) => {
+									const found = probed[a.id];
+									if (!found) return a;
+									return {
+										...a,
+										...(found.video
+											? { video: { codec: "unknown", fps: 0, ...a.video, ...found.video } }
+											: {}),
+										...(found.camera && a.cameraTrack
+											? { cameraTrack: { ...a.cameraTrack, ...found.camera } }
+											: {}),
+									};
+								}),
+							},
+							{ history: false },
+						),
+					);
+					// A failed save (disk full, say), or one that never settles, leaves the dims unwritten:
+					// a later change retries them without counting a failed probe. The deadline keeps a
+					// hung save from stalling every batch queued behind it.
+					if (saved !== true)
+						for (const id of Object.keys(probed)) probedAssetIdsRef.current.delete(id);
+				})
+				// A failed write must not stall the next batch.
+				.catch(() => undefined);
 		})();
 	}, [document]);
 
@@ -1394,6 +1439,11 @@ export function useTimeline() {
 	// section was never touched (leave the stored value alone); `null` clears it back to
 	// "no crop" (full frame) rather than storing the identity region explicitly.
 	//
+	// Rotation follows the same rule: `undefined` leaves the stored value, `0` removes the
+	// field, `180` sets it. It goes in before the source range, because `setClipSourceRange`
+	// joins contiguous clips: a trim that makes the media meet an upright neighbour must not
+	// let that neighbour swallow a clip turned in the same Apply.
+	//
 	// The document is read from the store, not off the render closure, so this composes
 	// with `useSequentialTimelineOps`: queued behind another timeline write, it still sees
 	// what that write committed. Same reason as `setTrimEntries` / `insertClipAt`.
@@ -1403,10 +1453,64 @@ export function useTimeline() {
 			sourceStartSec: number,
 			sourceEndSec: number,
 			cropRegion?: AxcutClipCropRegion | null,
+			rotation?: ClipRotation,
 		) => {
 			const doc = useProjectStore.getState().document;
 			if (!doc) return;
-			const next = setClipSourceRange(doc, clipId, sourceStartSec, sourceEndSec, cropRegion);
+			const current = doc.timeline.clips.find((c) => c.id === clipId);
+			const turning = rotation !== undefined && !!current && clipRotation(current) !== rotation;
+			const turned: AxcutDocument =
+				rotation === undefined
+					? doc
+					: {
+							...doc,
+							timeline: {
+								...doc.timeline,
+								clips: doc.timeline.clips.map((c) => {
+									if (c.id !== clipId) return c;
+									const { rotation: _old, ...rest } = c;
+									return rotation === 180 ? { ...rest, rotation: 180 as const } : rest;
+								}),
+							},
+							// A stored zoom focus is where the viewer sees it; turning the clip moves that
+							// content to the mirrored point, so the clip's own zooms follow it.
+							zoomRanges: turning
+								? doc.zoomRanges.map((z) =>
+										z.clipId === clipId
+											? { ...z, focus: { ...z.focus, cx: 1 - z.focus.cx, cy: 1 - z.focus.cy } }
+											: z,
+									)
+								: doc.zoomRanges,
+							// A footage-space privacy blur must stay on what it hides, so it moves with
+							// that content, freehand outline included. Frame-space annotations, text and
+							// figures do not turn. Clamped at 0 like `turnCropRegion`: a box flush against
+							// the far edge would turn to -5e-15.
+							annotations: turning
+								? doc.annotations.map((a) =>
+										a.clipId === clipId && a.type === "blur" && a.space !== "frame"
+											? {
+													...a,
+													position: {
+														x: Math.max(0, 100 - a.position.x - a.size.width),
+														y: Math.max(0, 100 - a.position.y - a.size.height),
+													},
+													...(a.blurData?.freehandPoints
+														? {
+																blurData: {
+																	...a.blurData,
+																	freehandPoints: a.blurData.freehandPoints.map((p) => ({
+																		x: Math.max(0, 100 - p.x),
+																		y: Math.max(0, 100 - p.y),
+																	})),
+																},
+															}
+														: {}),
+												}
+											: a,
+									)
+								: doc.annotations,
+						};
+			const next = setClipSourceRange(turned, clipId, sourceStartSec, sourceEndSec, cropRegion);
 			await saveDocument(next, { history: true });
 		},
 		[saveDocument],
@@ -1694,7 +1798,15 @@ export function useTimeline() {
 	// track's own — `anchorAudioTrackFragments` re-derives each fragment's
 	// advance from the new geometry.
 	const placeAudioTrack = useCallback(
-		async (trackId: string, span: { startMs: number; endMs: number; offsetMs?: number }) => {
+		async (
+			trackId: string,
+			span: {
+				startMs: number;
+				endMs: number;
+				offsetMs?: number;
+				mode?: "move" | "resize" | "resize-start" | "slip";
+			},
+		) => {
 			const doc = useProjectStore.getState().document;
 			if (!doc) return;
 			// The door replaces the whole group, so the survivors no longer need naming here.
@@ -1716,12 +1828,13 @@ export function useTimeline() {
 			// A resize stops the dragged edge at the neighbour; a move keeps the take's
 			// duration and parks it against the wall. Cropping a take because it was
 			// dragged somewhere crowded would lose audio the user never asked to lose.
-			const next = placeAudioTrackInDocument(
-				doc,
-				moved,
-				() => createId("audio"),
-				span.offsetMs === undefined ? "move" : "resize",
-			);
+			const lengthChanged = moved.endMs - moved.startMs !== pill.endMs - pill.startMs;
+			const placementMode =
+				span.mode ?? (lengthChanged || span.offsetMs !== undefined ? "resize" : "move");
+			const next =
+				placementMode === "slip"
+					? patchAudioTrack(doc, trackId, { offsetMs: moved.offsetMs })
+					: placeAudioTrackInDocument(doc, moved, () => createId("audio"), placementMode);
 			if (next === doc) return;
 			await saveDocument(next, { history: true });
 		},

@@ -2,7 +2,7 @@
 // hand, and the editor is a document behind a revision.
 
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type AxcutDocument,
 	createEmptyDocument,
@@ -15,6 +15,7 @@ import {
 	type TakePrefs,
 	takePrefs,
 } from "./app-recorder";
+import { NO_WEBCAM_PICTURE } from "./media-tools";
 import type { McpApplyResult } from "./openscreen-mcp-server";
 
 const VIDEO = path.resolve("recordings", "take.webm");
@@ -102,9 +103,13 @@ function setup(overrides: Partial<AppRecorderDeps> = {}) {
 }
 
 /** A take started as the app would: the HUD reports it recording once it was handed over. */
-async function started(recorder: ReturnType<typeof setup>["recorder"], calls: string[]) {
+async function started(
+	recorder: ReturnType<typeof setup>["recorder"],
+	calls: string[],
+	request = REQUEST,
+) {
 	const handedOver = calls.filter((call) => call === "startTake").length;
-	const starting = recorder.start(REQUEST);
+	const starting = recorder.start(request);
 	while (calls.filter((call) => call === "startTake").length === handedOver) {
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	}
@@ -113,6 +118,19 @@ async function started(recorder: ReturnType<typeof setup>["recorder"], calls: st
 }
 
 describe("an MCP take in the app", () => {
+	it("restores settings and permits retry when the handoff rejects a take", async () => {
+		const startTake = vi.fn().mockImplementationOnce(() => {
+			throw new Error("A Windows update is pending");
+		});
+		const { recorder, calls } = setup({ startTake });
+		await expect(recorder.start(REQUEST)).rejects.toThrow("Windows update is pending");
+		expect(calls).toEqual(["prepare My App", "restore"]);
+		const retry = recorder.start(REQUEST);
+		await vi.waitFor(() => expect(startTake).toHaveBeenCalledTimes(2));
+		recorder.recordingChanged(true);
+		expect((await retry).startedAt).toBeGreaterThan(0);
+	});
+
 	it("goes through the recording bar, and hands back the project the editor opened", async () => {
 		const { recorder, calls, editor } = setup();
 		const starting = recorder.start(REQUEST);
@@ -157,6 +175,20 @@ describe("an MCP take in the app", () => {
 		expect(editor.applied).toEqual([]);
 	});
 
+	it("releases only the client take whose app lifecycle finished", async () => {
+		const { recorder, calls } = setup();
+		const starting = recorder.start(REQUEST);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		recorder.recordingChanged(true, 7);
+		await starting;
+		recorder.recordingFinished(6);
+		await expect(recorder.start(REQUEST)).rejects.toThrow("already recording");
+		recorder.recordingChanged(false, 7);
+		recorder.recordingFinished(7);
+		expect(calls.filter((call) => call === "restore")).toHaveLength(1);
+		await expect(started(recorder, calls)).resolves.toBeDefined();
+	});
+
 	it("refuses a take while one records, or while the editor holds unsaved changes", async () => {
 		const busy = setup({ isRecording: () => true });
 		await expect(busy.recorder.start(REQUEST)).rejects.toThrow("already recording");
@@ -187,6 +219,15 @@ describe("an MCP take in the app", () => {
 		await expect(take.stop(undefined)).rejects.toThrow(`saved to ${VIDEO}`);
 	});
 
+	it("says so when the webcam asked for recorded no picture", async () => {
+		const { recorder, calls, editor } = setup();
+		const take = await started(recorder, calls, { ...REQUEST, camera: true });
+		recorder.recordingChanged(false);
+		recorder.takeSaved(VIDEO);
+		editor.document = takeDocument(12);
+		expect((await take.stop(undefined)).warnings).toEqual([NO_WEBCAM_PICTURE]);
+	});
+
 	it("fails a take the bar never hands over", async () => {
 		const { recorder, calls } = setup();
 		const take = await started(recorder, calls);
@@ -197,6 +238,7 @@ describe("an MCP take in the app", () => {
 });
 
 describe("the recording bar's settings for a client's take", () => {
+	const USER_CAMERA = { camDeviceId: "cam-streamcam", camDeviceName: "Logitech StreamCam" };
 	const listed = {
 		displays: [],
 		windows: [],
@@ -211,6 +253,7 @@ describe("the recording bar's settings for a client's take", () => {
 			takePrefs(
 				{ ...REQUEST, mic: true, camera: true, cameraDevice: "brio", cursorMode: "system" },
 				listed,
+				USER_CAMERA,
 			),
 		).toEqual({
 			micEnabled: true,
@@ -224,24 +267,35 @@ describe("the recording bar's settings for a client's take", () => {
 		});
 	});
 
+	it("records the user's own camera when none is named, not the first one listed", () => {
+		expect(takePrefs({ ...REQUEST, camera: true }, listed, USER_CAMERA)).toMatchObject({
+			camEnabled: true,
+			camDeviceId: "cam-streamcam",
+			camDeviceName: "Logitech StreamCam",
+		});
+	});
+
 	it("turns off what the request leaves out, the user's camera included", () => {
-		expect(takePrefs(REQUEST, null)).toMatchObject({ micEnabled: false, camEnabled: false });
+		expect(takePrefs(REQUEST, null, USER_CAMERA)).toMatchObject({
+			micEnabled: false,
+			camEnabled: false,
+		});
 	});
 
 	it("refuses a device no listed name contains", () => {
-		expect(() => takePrefs({ ...REQUEST, camera: true, cameraDevice: "Facetime" }, listed)).toThrow(
-			`No camera's name contains "Facetime"`,
-		);
-		expect(() => takePrefs({ ...REQUEST, mic: true, micDevice: "Yeti" }, null)).toThrow(
-			"No microphone's name",
-		);
+		expect(() =>
+			takePrefs({ ...REQUEST, camera: true, cameraDevice: "Facetime" }, listed, USER_CAMERA),
+		).toThrow(`No camera's name contains "Facetime"`);
+		expect(() =>
+			takePrefs({ ...REQUEST, mic: true, micDevice: "Yeti" }, null, USER_CAMERA),
+		).toThrow("No microphone's name");
 	});
 
 	it("puts back exactly the settings a take changes", () => {
 		const user: TakePrefs & { hideDesktopIcons: boolean } = {
-			...takePrefs({ ...REQUEST, camera: true }, null),
+			...takePrefs({ ...REQUEST, camera: true }, null, USER_CAMERA),
 			hideDesktopIcons: true,
 		};
-		expect(pickTakePrefs(user)).toEqual(takePrefs({ ...REQUEST, camera: true }, null));
+		expect(pickTakePrefs(user)).toEqual(takePrefs({ ...REQUEST, camera: true }, null, USER_CAMERA));
 	});
 });

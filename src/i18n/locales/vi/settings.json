@@ -351,7 +351,12 @@
 		"done": "Hoàn tất",
 		"ratio": "Tỷ lệ",
 		"cropVideo": "Cắt xén video",
-		"lockAspectRatio": "Khóa tỷ lệ khung hình"
+		"lockAspectRatio": "Khóa tỷ lệ khung hình",
+		"x": "X (px)",
+		"y": "Y (px)",
+		"width": "Chiều rộng (px)",
+		"height": "Chiều cao (px)",
+		"position": "Vị trí và kích thước vùng cắt tính bằng pixel"
 	},
 	"zoom": {
 		"position": {
@@ -388,6 +393,7 @@
 	},
 	"audio": {
 		"outputGain": "Mức đầu ra",
+		"muteRecording": "Tắt tiếng bản ghi",
 		"help": "Giọng nói được tự động cân bằng về độ lớn tiêu chuẩn. Hãy điều chỉnh mức đầu ra từ đó; nó được áp dụng giống hệt nhau trong bản xem trước và khi xuất.",
 		"reset": "Đặt lại âm thanh",
 		"title": "Âm thanh"

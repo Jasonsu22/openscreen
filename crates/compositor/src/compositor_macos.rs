@@ -29,7 +29,7 @@
 
 use crate::config::Cfg;
 use crate::d3d::Gpu;
-use crate::ffi::AVFrame;
+use crate::ffi::{AVColorSpace, AVFrame};
 // Le constant buffer est le MÊME struct des deux côtés — cf. `frame_geometry`.
 // Constant buffer, params runtime et constantes de sortie : une seule définition pour
 // les deux backends — cf. `frame_geometry`, qui documente les divergences que
@@ -99,7 +99,14 @@ extern "C" {
     fn CVPixelBufferGetHeightOfPlane(p: *mut std::ffi::c_void, plane_index: usize) -> usize;
     fn CVPixelBufferGetWidth(p: *mut std::ffi::c_void) -> usize;
     fn CVPixelBufferGetHeight(p: *mut std::ffi::c_void) -> usize;
+    fn CVPixelBufferGetPixelFormatType(p: *mut std::ffi::c_void) -> u32;
 }
+
+/// `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` ('x420') et sa variante pleine
+/// excursion ('xf20') : le P010 que VideoToolbox sort pour un flux 10 bits (HEVC Main 10).
+const CV_420_10_BIPLANAR_VIDEO: u32 = u32::from_be_bytes(*b"x420");
+const CV_420_10_BIPLANAR_FULL: u32 = u32::from_be_bytes(*b"xf20");
+const CV_420_8_BIPLANAR_FULL: u32 = u32::from_be_bytes(*b"420f");
 
 /// `retain` ObjC sur un `id`. `CVMetalTextureGetTexture` rend une référence
 /// *empruntée* au `CVMetalTextureRef` qui la porte : relâcher ce dernier sans
@@ -195,6 +202,50 @@ impl CVMetalTextureCache {
     /// alors sur l'IOSurface précédent).
     pub(crate) fn flush(&self) {
         unsafe { CVMetalTextureCacheFlush(self.0.as_ptr(), 0) };
+    }
+}
+
+// `MTLTextureSwizzle` ; absent des bindings `metal` 0.29.
+const SWZ_ZERO: u8 = 0;
+const SWZ_ONE: u8 = 1;
+const SWZ_RED: u8 = 2;
+const SWZ_GREEN: u8 = 3;
+const SWZ_ALPHA: u8 = 5;
+
+/// Vue de `tex` qui rend `swizzle` (rouge, vert, bleu, alpha). C'est ainsi que `sample_yuv`
+/// (`shaders.metal`) lit le format d'une frame sans rien lier de plus à chaque draw :
+/// - bleu à 1 sur le plan CbCr : pleine plage (`420f`, `xf20`) ;
+/// - vert ou bleu à 1 sur le plan Y : matrice BT.601 ou BT.2020.
+///
+/// Sans vue, `R` et `RG` rendent 0 sur les canaux libres : plage limitée et BT.709 par défaut.
+fn swizzled_view(tex: &metal::TextureRef, swizzle: [u8; 4]) -> metal::Texture {
+    use objc::{msg_send, sel, sel_impl};
+    #[repr(C)]
+    struct Swizzle([u8; 4]);
+    let one = metal::NSRange::new(0, 1);
+    unsafe {
+        msg_send![tex, newTextureViewWithPixelFormat:tex.pixel_format()
+                                         textureType:tex.texture_type()
+                                              levels:one
+                                               slices:one
+                                             swizzle:Swizzle(swizzle)]
+    }
+}
+
+/// Le swizzle du plan Y qui porte la matrice de la frame, ou `None` pour BT.709 (aussi le
+/// défaut d'un flux non tagué). La matrice vient de `AVFrame::colorspace`, que libavcodec lit
+/// dans le VUI : VideoToolbox ne pose pas `kCVImageBufferYCbCrMatrixKey` sur ses buffers.
+/// BT.2020 CL n'est pas une simple matrice : il garde le défaut plutôt qu'un rendu NCL faux.
+///
+/// Alpha à 0 : échantillons 10 bits (P010), que `yuv_matrix` convertit avec les bornes 10 bits.
+fn matrix_swizzle(colorspace: AVColorSpace::Type, ten_bit: bool) -> Option<[u8; 4]> {
+    let depth = if ten_bit { SWZ_ZERO } else { SWZ_ONE };
+    match colorspace {
+        AVColorSpace::AVCOL_SPC_BT470BG | AVColorSpace::AVCOL_SPC_SMPTE170M => {
+            Some([SWZ_RED, SWZ_ONE, SWZ_ZERO, depth])
+        }
+        AVColorSpace::AVCOL_SPC_BT2020_NCL => Some([SWZ_RED, SWZ_ZERO, SWZ_ONE, depth]),
+        _ => None,
     }
 }
 
@@ -1156,6 +1207,11 @@ impl Compositor {
     /// Crée les `MTLTexture` Y (`R8Unorm`) et UV (`RG8Unorm`) de la frame. Zéro copie :
     /// les textures Metal partagent l'IOSurface du `CVPixelBuffer`. API symétrique de
     /// `compositor_windows::nv12_srvs`.
+    ///
+    /// Un flux 10 bits arrive en P010 : 16 bits par échantillon, valeur dans les bits de
+    /// poids fort. En `R16Unorm`/`RG16Unorm` le shader lit la même valeur normalisée qu'en
+    /// NV12 ; en `R8Unorm` chaque échantillon devenait deux texels, d'où l'image en bandes
+    /// d'une vidéo iPhone (#1390).
     pub unsafe fn nv12_srvs(
         &self,
         frame: *const AVFrame,
@@ -1167,8 +1223,22 @@ impl Compositor {
             )
         })?;
         let cache = &self.metal_texture_cache;
-        let y = cache.make_texture_from_pixel_buffer(pb, 0, metal::MTLPixelFormat::R8Unorm)?;
-        let uv = cache.make_texture_from_pixel_buffer(pb, 1, metal::MTLPixelFormat::RG8Unorm)?;
+        let pixel_format = CVPixelBufferGetPixelFormatType(pb);
+        let (y_fmt, uv_fmt) = match pixel_format {
+            CV_420_10_BIPLANAR_VIDEO | CV_420_10_BIPLANAR_FULL => {
+                (metal::MTLPixelFormat::R16Unorm, metal::MTLPixelFormat::RG16Unorm)
+            }
+            _ => (metal::MTLPixelFormat::R8Unorm, metal::MTLPixelFormat::RG8Unorm),
+        };
+        let mut y = cache.make_texture_from_pixel_buffer(pb, 0, y_fmt)?;
+        let mut uv = cache.make_texture_from_pixel_buffer(pb, 1, uv_fmt)?;
+        let ten_bit = matches!(pixel_format, CV_420_10_BIPLANAR_VIDEO | CV_420_10_BIPLANAR_FULL);
+        if let Some(swizzle) = matrix_swizzle((*frame).colorspace, ten_bit) {
+            y = swizzled_view(&y, swizzle);
+        }
+        if matches!(pixel_format, CV_420_8_BIPLANAR_FULL | CV_420_10_BIPLANAR_FULL) {
+            uv = swizzled_view(&uv, [SWZ_RED, SWZ_GREEN, SWZ_ONE, SWZ_ALPHA]);
+        }
         Ok((y, uv))
     }
 
@@ -2739,119 +2809,122 @@ impl Compositor {
                 *self.bg_cache.borrow_mut() = Some(BgCache { key, tex });
             }
         }
-        // --- écran : ombre puis vidéo ---
-        let s_px = [g.s_dst[2] * rw, g.s_dst[3] * rh];
-        // Géométrie du tilt calculée UNE fois : l'ombre et l'écran doivent porter exactement
-        // le même quadrilatère, sinon l'ombre se décolle dès que l'un des deux change.
-        let tilt = g.screen_tilt(s_px);
-        // Flou de mouvement de l'écran CADRÉ (`FrameGeometry::screen_trail`) : ombre, cadre,
-        // métrage et appareil se dessinent dans un rendu isolé et transparent, que le mode 18
-        // recompose ensuite sur le fond le long de la trajectoire de la boîte, ou du plan incliné.
-        let trail = g.screen_trail([rw, rh]);
-        let mut enc = if trail {
-            self.begin_pass(
-                cmd_buf,
-                &self.trail,
-                Some(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0)),
-                &self.pipeline_main,
-            )?
-        } else {
-            self.begin_pass(cmd_buf, &self.rt, None, &self.pipeline_main)?
-        };
-        enc.set_fragment_texture(0, Some(&sy));
-        enc.set_fragment_texture(1, Some(&suv));
-        let quad_center_px = [
-            (g.s_dst[0] + g.s_dst[2] * 0.5) * rw,
-            (g.s_dst[1] + g.s_dst[3] * 0.5) * rh,
-        ];
-        if cfg.shadow {
-            let spread = SCREEN_SHADOW_SPREAD_FRAC * g.screen_unit_px;
-            let offset = g.screen_shadow_offset();
-            let opacity = 0.45 * lp.shadow_scale;
-            // L'ombre suit la silhouette réellement affichée : rect arrondi quand l'écran est
-            // droit, quadrilatère projeté quand il est penché. Un rect droit derrière un écran
-            // incliné se lit comme une seconde surface, pas comme son ombre. Avec un cadre de
-            // fenêtre, c'est le CADRE qui la porte (`shadow_caster`) ; un appareil porte celle de
-            // sa silhouette 3D (mode 17), pas celle d'un quad.
-            if let Some(cb) = g.device_shadow_cb([rw, rh], spread, offset, opacity) {
-                self.draw_solid(enc, &cb);
+        if g.show_screen {
+            // --- écran : ombre puis vidéo ---
+            let s_px = [g.s_dst[2] * rw, g.s_dst[3] * rh];
+            // Géométrie du tilt calculée UNE fois : l'ombre et l'écran doivent porter exactement
+            // le même quadrilatère, sinon l'ombre se décolle dès que l'un des deux change.
+            let tilt = g.screen_tilt(s_px);
+            // Flou de mouvement de l'écran CADRÉ (`FrameGeometry::screen_trail`) : ombre, cadre,
+            // métrage et appareil se dessinent dans un rendu isolé et transparent, que le mode 18
+            // recompose ensuite sur le fond le long de la trajectoire de la boîte, ou du plan incliné.
+            let trail = g.screen_trail([rw, rh]);
+            let mut enc = if trail {
+                self.begin_pass(
+                    cmd_buf,
+                    &self.trail,
+                    Some(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0)),
+                    &self.pipeline_main,
+                )?
             } else {
-                match g.shadow_caster([rw, rh]) {
-                    ShadowCaster::Upright { dst, size_px, radius } => {
-                        self.draw_shadow(enc, dst, size_px, radius, spread, offset, opacity)
+                self.begin_pass(cmd_buf, &self.rt, None, &self.pipeline_main)?
+            };
+            enc.set_fragment_texture(0, Some(&sy));
+            enc.set_fragment_texture(1, Some(&suv));
+            let quad_center_px = [
+                (g.s_dst[0] + g.s_dst[2] * 0.5) * rw,
+                (g.s_dst[1] + g.s_dst[3] * 0.5) * rh,
+            ];
+            if cfg.shadow {
+                let spread = SCREEN_SHADOW_SPREAD_FRAC * g.screen_unit_px;
+                let offset = g.screen_shadow_offset();
+                let opacity = 0.45 * lp.shadow_scale;
+                // L'ombre suit la silhouette réellement affichée : rect arrondi quand l'écran est
+                // droit, quadrilatère projeté quand il est penché. Un rect droit derrière un écran
+                // incliné se lit comme une seconde surface, pas comme son ombre. Avec un cadre de
+                // fenêtre, c'est le CADRE qui la porte (`shadow_caster`) ; un appareil porte celle de
+                // sa silhouette 3D (mode 17), pas celle d'un quad.
+                if let Some(cb) = g.device_shadow_cb([rw, rh], spread, offset, opacity) {
+                    self.draw_solid(enc, &cb);
+                } else {
+                    match g.shadow_caster([rw, rh]) {
+                        ShadowCaster::Upright { dst, size_px, radius } => {
+                            self.draw_shadow(enc, dst, size_px, radius, spread, offset, opacity)
+                        }
+                        ShadowCaster::Tilted { corners, center_px, radius, mask } => self.draw_quad_shadow(
+                            enc, &corners, center_px, radius, mask, spread, offset, opacity,
+                        ),
                     }
-                    ShadowCaster::Tilted { corners, center_px, radius, mask } => self.draw_quad_shadow(
-                        enc, &corners, center_px, radius, mask, spread, offset, opacity,
-                    ),
                 }
             }
-        }
-        // Le cadre (mode 14) passe SOUS l'écran, qui ne laisse voir que la barre et le filet.
-        if let Some(cb) = g.window_frame_cb([rw, rh]) {
-            self.draw_solid(enc, &cb);
-        }
-        let square_top = g.screen_square_top();
-        let top_lift = g.screen_top_lift_px([rw, rh]);
-        let [su0, sv0, su1, sv1] = g.cut;
-        // Sous le masque d'un layout en bloc, rogné au slot (`FrameGeometry::mask_flat_screen`).
-        let (dst, src, quad_px, radius_px) =
-            g.mask_flat_screen(g.s_dst, [su0, sv0, su1, sv1], s_px, g.s_radius, [rw, rh]);
-        match tilt.as_ref() {
-            None => self.draw_video(
-                enc,
-                &LayerCB {
-                    dst,
-                    src,
-                    quad_px,
-                    radius_px,
-                    mode: 0.0,
-                    color: [0.0, 0.0, 0.0, 1.0],
-                    src_prev: [su0, sv0, su1, sv1],
-                    dst_prev: g.s_dst_prev,
-                    mb: [g.screen_pixel_taps([rw, rh]), g.mb_amount, top_lift, square_top],
-                    ..Default::default()
-                },
-                &sy,
-                &suv,
-            ),
-            Some(quad) => self.draw_tilted_screen(
-                enc,
-                quad,
-                s_px,
-                quad_center_px,
-                g.cut,
-                g.focus_plane,
-                g.s_radius,
-                top_lift,
-                g.screen_mask,
-                g.tilt_pixel_trail([rw, rh]),
-                &sy,
-                &suv,
-                dof_pyramid.as_ref(),
-            ),
-        }
-        // L'appareil modelé (mode 17) passe APRÈS l'écran, et non sous lui comme le chrome plat :
-        // son socle vient DEVANT le plan du métrage et sa lunette mord dessus. Le shader s'arrête
-        // au plan du métrage dans l'ouverture, donc il ne recouvre jamais l'image.
-        if let Some(cb) = g.device_frame_cb([rw, rh]) {
-            self.draw_solid(enc, &cb);
-        }
-        if trail {
+            // Le cadre (mode 14) passe SOUS l'écran, qui ne laisse voir que la barre et le filet.
+            if let Some(cb) = g.window_frame_cb([rw, rh]) {
+                self.draw_solid(enc, &cb);
+            }
+            let square_top = g.screen_square_top();
+            let top_lift = g.screen_top_lift_px([rw, rh]);
+            // The screen texture's source rect: a turned clip samples it with reversed bounds.
+            let [su0, sv0, su1, sv1] = g.screen_src(g.cut);
+            // Sous le masque d'un layout en bloc, rogné au slot (`FrameGeometry::mask_flat_screen`).
+            let (dst, src, quad_px, radius_px) =
+                g.mask_flat_screen(g.s_dst, [su0, sv0, su1, sv1], s_px, g.s_radius, [rw, rh]);
+            match tilt.as_ref() {
+                None => self.draw_video(
+                    enc,
+                    &LayerCB {
+                        dst,
+                        src,
+                        quad_px,
+                        radius_px,
+                        mode: 0.0,
+                        color: [0.0, 0.0, 0.0, 1.0],
+                        src_prev: [su0, sv0, su1, sv1],
+                        dst_prev: g.s_dst_prev,
+                        mb: [g.screen_pixel_taps([rw, rh]), g.mb_amount, top_lift, square_top],
+                        ..Default::default()
+                    },
+                    &sy,
+                    &suv,
+                ),
+                Some(quad) => self.draw_tilted_screen(
+                    enc,
+                    quad,
+                    s_px,
+                    quad_center_px,
+                    g.screen_src(g.cut),
+                    g.focus_plane,
+                    g.s_radius,
+                    top_lift,
+                    g.screen_mask,
+                    g.tilt_pixel_trail([rw, rh]),
+                    &sy,
+                    &suv,
+                    dof_pyramid.as_ref(),
+                ),
+            }
+            // L'appareil modelé (mode 17) passe APRÈS l'écran, et non sous lui comme le chrome plat :
+            // son socle vient DEVANT le plan du métrage et sa lunette mord dessus. Le shader s'arrête
+            // au plan du métrage dans l'ouverture, donc il ne recouvre jamais l'image.
+            if let Some(cb) = g.device_frame_cb([rw, rh]) {
+                self.draw_solid(enc, &cb);
+            }
+            if trail {
+                enc.end_encoding();
+                enc = self.begin_pass(cmd_buf, &self.rt, None, &self.pipeline_main)?;
+                // texture(2) = l'écran cadré isolé ; texture(5) = la pyramide, avec laquelle le repli
+                // relit le métrage hors de la sortie comme le mode 8 l'a dessiné.
+                enc.set_fragment_texture(2, Some(&self.trail));
+                enc.set_fragment_texture(5, dof_pyramid.as_ref().map(|t| &**t));
+                self.draw_video(enc, &g.screen_trail_cb([rw, rh], dof_pyramid.is_some()), &sy, &suv);
+            }
+
             enc.end_encoding();
-            enc = self.begin_pass(cmd_buf, &self.rt, None, &self.pipeline_main)?;
-            // texture(2) = l'écran cadré isolé ; texture(5) = la pyramide, avec laquelle le repli
-            // relit le métrage hors de la sortie comme le mode 8 l'a dessiné.
-            enc.set_fragment_texture(2, Some(&self.trail));
-            enc.set_fragment_texture(5, dof_pyramid.as_ref().map(|t| &**t));
-            self.draw_video(enc, &g.screen_trail_cb([rw, rh], dof_pyramid.is_some()), &sy, &suv);
+
+            // --- flous de confidentialité : sur le métrage, AVANT le curseur (parité Windows). Le
+            // curseur reste net par-dessus, et le cristal de Prism Glow, qui réfracte l'image
+            // composée, n'y voit que des pixels déjà floutés.
+            self.draw_annotations(cmd_buf, &self.rt, scene_ref.as_ref(), g.source_t, g.s_ann, &g, true)?;
         }
-
-        enc.end_encoding();
-
-        // --- flous de confidentialité : sur le métrage, AVANT le curseur (parité Windows). Le
-        // curseur reste net par-dessus, et le cristal de Prism Glow, qui réfracte l'image
-        // composée, n'y voit que des pixels déjà floutés.
-        self.draw_annotations(cmd_buf, &self.rt, scene_ref.as_ref(), g.source_t, g.s_ann, &g, true)?;
 
         // La pointe et les clics récents, tels que les effets shader les lisent : ceux de
         // l'enregistrement, que le curseur soit dessiné ou non (`effect_pointer`).
@@ -3090,7 +3163,7 @@ impl Compositor {
         };
         // L'enregistrement à sa résolution, peint une fois pour la frame si un effet le lit.
         let footage = if effects.iter().any(|e| crate::shader_fx::reads_footage(e)) {
-            Some(self.fill_footage_copy(cmd_buf, &sy, &suv, g.content_cut, stw, sth)?)
+            Some(self.fill_footage_copy(cmd_buf, &sy, &suv, g.screen_src(g.content_cut), stw, sth)?)
         } else {
             None
         };
@@ -3816,6 +3889,10 @@ mod tests {
         fn from_planes(w: u32, h: u32, y: &[u8], uv: &[u8]) -> FakeFrame {
             let pb = crate::mac_frames::nv12_pixel_buffer_from_planes(w, h, y, uv)
                 .expect("CVPixelBuffer NV12");
+            FakeFrame::from_pixel_buffer(w, h, pb)
+        }
+
+        fn from_pixel_buffer(w: u32, h: u32, pb: crate::mac_frames::CVPixelBufferRef) -> FakeFrame {
             let mut frame: Box<AVFrame> = Box::new(unsafe { std::mem::zeroed() });
             frame.format = crate::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
             frame.data[3] = pb.as_ptr() as *mut u8;
@@ -3826,6 +3903,44 @@ mod tests {
 
         fn as_ptr(&self) -> *const AVFrame {
             &*self.frame as *const AVFrame
+        }
+    }
+
+    /// Les vues que `nv12_srvs` tire de chaque format biplanaire de VideoToolbox, sans
+    /// décoder ni fichier média. Un flux 10 bits (`x420`, `xf20`) se lit en plans 16 bits,
+    /// sinon l'image part en bandes (#1390). Une frame pleine plage (`420f`, `xf20`) porte un
+    /// 1 dans le bleu de sa vue CbCr : c'est le drapeau que `sample_yuv` lit.
+    #[test]
+    fn nv12_srvs_reads_bit_depth_and_range_from_the_pixel_format() {
+        use metal::MTLPixelFormat::{R16Unorm, R8Unorm, RG16Unorm, RG8Unorm};
+        use objc::{msg_send, sel, sel_impl};
+        #[repr(C)]
+        struct Swizzle([u8; 4]);
+        const SWIZZLE_ONE: u8 = 1;
+
+        let Ok(gpu) = crate::d3d::Gpu::create(false) else {
+            eprintln!("pas de device Metal — test sauté");
+            return;
+        };
+        let comp = super::Compositor::new_sized(&gpu, 64, 64).expect("Compositor::new_sized");
+        for (fourcc, y_fmt, uv_fmt, full_range) in [
+            (b"420v", R8Unorm, RG8Unorm, false),
+            (b"420f", R8Unorm, RG8Unorm, true),
+            (b"x420", R16Unorm, RG16Unorm, false),
+            (b"xf20", R16Unorm, RG16Unorm, true),
+        ] {
+            let name = std::str::from_utf8(fourcc).unwrap();
+            let pb = unsafe {
+                crate::mac_frames::create_nv12_pixel_buffer(64, 64, u32::from_be_bytes(*fourcc))
+            }
+            .unwrap_or_else(|e| panic!("{name} : {e}"));
+            let frame = FakeFrame::from_pixel_buffer(64, 64, pb);
+            let (y, uv) = unsafe { comp.nv12_srvs(frame.as_ptr()) }
+                .unwrap_or_else(|e| panic!("{name} : {e}"));
+            assert_eq!(y.pixel_format(), y_fmt, "{name} : plan Y");
+            assert_eq!(uv.pixel_format(), uv_fmt, "{name} : plan CbCr");
+            let swizzle: Swizzle = unsafe { msg_send![uv, swizzle] };
+            assert_eq!(swizzle.0[2] == SWIZZLE_ONE, full_range, "{name} : drapeau pleine plage");
         }
     }
 
@@ -3860,6 +3975,10 @@ mod tests {
     /// d'ombre passerait alors pour une suppression réussie.
     fn compose_pip(comp: &super::Compositor, effect: &str, shadow: bool) -> Vec<u8> {
         let scene = crate::scene::Scene::from_json(&pip_scene_json(effect)).expect("scene json");
+        compose_pip_scene(comp, scene, shadow)
+    }
+
+    fn compose_pip_scene(comp: &super::Compositor, scene: crate::scene::Scene, shadow: bool) -> Vec<u8> {
         comp.set_live_params(live_params_from_scene(&scene));
         comp.set_has_webcam(true);
         comp.set_scene(Some(scene));
@@ -3890,6 +4009,32 @@ mod tests {
 
     const NO_EFFECT: &str = "null";
     const CUTOUT: &str = r#"{"mode":"transparent","blurIntensity":0,"background":null,"modelPath":null}"#;
+
+    #[test]
+    fn camera_only_cutout_reveals_wallpaper_instead_of_screen() {
+        let Ok(gpu) = crate::d3d::Gpu::create(false) else {
+            eprintln!("no Metal device — test skipped");
+            return;
+        };
+        let comp = Compositor::new_sized(&gpu, 320, 180).expect("compositor");
+        for legacy in [false, true] {
+            let mut scene = crate::scene::Scene::from_json(&pip_scene_json(CUTOUT)).expect("scene");
+            scene.layout.preset = if legacy { "picture-in-picture" } else { "camera-only" }.to_owned();
+            if legacy {
+                scene.camera_fullscreen_regions = serde_json::from_str(r#"[{"startSec":-10,"endSec":10}]"#).expect("legacy camera span");
+            }
+            scene.layout.webcam_rect = Some(crate::scene::SceneRect {
+                x: 0.0, y: 0.0, width: 1.0, height: 1.0,
+            });
+            comp.set_webcam_mask(&half_mask(8, 8), 8, 8).expect("mask");
+            let rgba = compose_pip_scene(&comp, scene, true);
+            assert!(camera_pixels(&rgba) > 10_000, "the foreground camera must remain visible");
+            let blue = rgba.chunks_exact(4).filter(|px| px[0] < 10 && (px[1] as i16 - 128).abs() < 10 && px[2] > 245).count();
+            assert!(blue > 20_000, "cutout must reveal the blue wallpaper, not the gray screen: {blue}");
+            let gray = rgba.chunks_exact(4).filter(|px| (110..150).contains(&px[0]) && (110..150).contains(&px[1]) && (110..150).contains(&px[2])).count();
+            assert_eq!(gray, 0, "camera-only leaked hidden screen pixels");
+        }
+    }
 
     /// Le piège que le brief nomme : un mode SANS masque ne doit rien changer.
     ///
@@ -5341,5 +5486,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         crate::shader_fx::compile_metal(&gpu.device, &code, &params).expect("compile");
         eprintln!("recompilation d'une source déjà vue : {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
+    fn matrix_swizzle_marks_matrix_and_depth() {
+        use AVColorSpace::*;
+        assert_eq!(
+            matrix_swizzle(AVCOL_SPC_SMPTE170M, false),
+            Some([SWZ_RED, SWZ_ONE, SWZ_ZERO, SWZ_ONE])
+        );
+        assert_eq!(
+            matrix_swizzle(AVCOL_SPC_BT2020_NCL, true),
+            Some([SWZ_RED, SWZ_ZERO, SWZ_ONE, SWZ_ZERO])
+        );
+        assert_eq!(matrix_swizzle(AVCOL_SPC_BT709, false), None);
+        assert_eq!(matrix_swizzle(AVCOL_SPC_BT2020_CL, true), None);
     }
 }

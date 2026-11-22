@@ -1,6 +1,9 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import type { Readable, Writable } from "node:stream";
+import type { NativeLinuxCaptureSource } from "../../../src/lib/nativeLinuxRecording";
 import type { CursorRecordingData } from "../../../src/native/contracts";
+import { salvageNativeMacCapture } from "../../recording/nativeMacCaptureSalvage";
 import {
 	type CursorPauseRange,
 	compactCursorTelemetryPauseRanges,
@@ -10,11 +13,11 @@ import {
 	PipeWireCursorAccumulator,
 	type PipeWireHelperEvent,
 } from "../cursor/recording/pipeWireCursorAccumulator";
-import { findPipeWireCursorHelperPath } from "../cursor/recording/pipeWireCursorRecordingSession";
+import { findLinuxCaptureHelperPath } from "../cursor/recording/pipeWireCursorRecordingSession";
 
 /**
  * Drives the Linux capture helper for a full recording: video, audio and cursor
- * telemetry from ONE portal session.
+ * telemetry from one backend: direct X11 capture, or ONE Wayland portal session.
  *
  * WHY ONE SESSION MATTERS ENOUGH TO BUILD THIS. `SelectSources` may be called
  * once per portal session, so a second process means a second picker. Before
@@ -48,6 +51,13 @@ const STOP_TIMEOUT_MS = 15_000;
  */
 const FIRST_FRAME_TIMEOUT_MS = 10_000;
 /**
+ * How long the portal's picker takes to leave the screen once it is answered. A take
+ * armed sooner had the dialog's closing animation in its first frame (seen on GNOME
+ * Wayland after Restart, the one start with no countdown in between): mutter animates
+ * a closing window for 150 ms, and the screencast stream lags it by a frame or two.
+ */
+const PICKER_CLOSE_MS = 500;
+/**
  * The most of the helper's output [`helperOutput`] keeps, in UTF-8 bytes: the 64 KiB
  * Save Diagnostics writes of each helper. Only the newest is kept, as on Windows and
  * macOS.
@@ -56,6 +66,8 @@ const HELPER_OUTPUT_MAX_BYTES = 64 * 1024;
 
 export interface LinuxCaptureConfig {
 	outputPath: string;
+	/** An explicit app/CLI selection for the direct X11 backend only. */
+	source?: NativeLinuxCaptureSource;
 	cursorMode: "metadata" | "embedded";
 	fps: number;
 	bitrate?: number;
@@ -85,9 +97,32 @@ export interface LinuxCaptureResult {
 	frames: number;
 	droppedFrames: number;
 	cursor: CursorRecordingData;
+	/**
+	 * Pause ranges relative to capture start, so an out-of-band cursor track
+	 * (the X11 pointer sampler) can be compacted the same way as `cursor`.
+	 */
+	cursorPauseRanges: CursorPauseRange[];
 	/** What the portal actually granted, when it said. */
 	sourceKind?: LinuxCaptureSourceKind;
 	videoEncoder?: string;
+	/**
+	 * Shown to the user when the editor opens the take. The session never sets it:
+	 * the helper's own warnings are English diagnostics, so main words this from
+	 * `audioLost` and `interrupted`.
+	 */
+	warning?: string;
+	/** An audio stream the user asked for could not be opened, so the take lacks it. */
+	audioLost?: true;
+	/**
+	 * The helper died before it was asked to stop, and this is the part of the take it
+	 * had written by then. `durationMs` and `frames` describe what was recovered.
+	 */
+	interrupted?: true;
+}
+
+/** The user dismissed the portal's picker: a choice, not a failure to report. */
+export function isPortalCancelled(error: unknown): boolean {
+	return (error as { code?: unknown } | null)?.code === "portal-cancelled";
 }
 
 export class LinuxNativeCaptureSession {
@@ -105,11 +140,23 @@ export class LinuxNativeCaptureSession {
 	private firstFrameTimer: NodeJS.Timeout | null = null;
 
 	private sourceSelected = false;
+	private sourceSelectedAtMs = 0;
 	private sourceSelectedResolve: (() => void) | null = null;
 	private sourceSelectedReject: ((error: Error) => void) | null = null;
+	/** The helper's error before any source was selected, for a wait registered after it. */
+	private sourceSelectionError: Error | null = null;
 	private armed = false;
 
 	private stopped: LinuxCaptureResult | null = null;
+	/** Set by `stop()` and `discard()`: from then on an exit is expected. */
+	private stopRequested = false;
+	private diedMidTake = false;
+	/**
+	 * Called when the helper exits mid-take without being asked to: it crashed, was
+	 * killed, or lost its stream. Without it the HUD kept counting and the user found
+	 * out only at Stop.
+	 */
+	onInterrupted: (() => void) | null = null;
 	private stoppedResolve: (() => void) | null = null;
 	private stoppedReject: ((error: Error) => void) | null = null;
 
@@ -117,11 +164,18 @@ export class LinuxNativeCaptureSession {
 	private negotiatedCursorMode: LinuxCaptureConfig["cursorMode"] | undefined;
 	private videoEncoder: string | undefined;
 	private lastError: string | null = null;
+	/** Why the helper exited, once it has: its error, or its exit code and signal. */
+	private exitReason: string | null = null;
+	private audioLost = false;
 	private paused = false;
 	private helperOutputText = "";
 	private cursorRecordingStartMs = 0;
 	private cursorPauseStartedAtMs: number | null = null;
 	private cursorPauseRanges: CursorPauseRange[] = [];
+	private captureOriginX: number | undefined;
+	private captureOriginY: number | undefined;
+	private captureWidth: number | undefined;
+	private captureHeight: number | undefined;
 
 	constructor(private readonly config: LinuxCaptureConfig) {
 		this.cursor = new PipeWireCursorAccumulator(config.maxCursorSamples);
@@ -133,7 +187,7 @@ export class LinuxNativeCaptureSession {
 	 * user to answer it.
 	 */
 	async start(): Promise<void> {
-		const helperPath = findPipeWireCursorHelperPath();
+		const helperPath = findLinuxCaptureHelperPath();
 		if (!helperPath) {
 			throw new Error(
 				"The Linux capture helper is not available. Build it with `npm run build:native:linux`.",
@@ -145,10 +199,15 @@ export class LinuxNativeCaptureSession {
 		this.cursorRecordingStartMs = 0;
 		this.cursorPauseStartedAtMs = null;
 		this.cursorPauseRanges = [];
+		this.captureOriginX = undefined;
+		this.captureOriginY = undefined;
+		this.captureWidth = undefined;
+		this.captureHeight = undefined;
 		this.paused = false;
 
 		const request = {
 			outputPath: this.config.outputPath,
+			...(this.config.source ? { source: this.config.source } : {}),
 			cursorMode: this.config.cursorMode,
 			video: {
 				fps: this.config.fps,
@@ -178,6 +237,7 @@ export class LinuxNativeCaptureSession {
 			const reason =
 				this.lastError ??
 				`the Linux capture helper exited (code=${code ?? "null"}, signal=${signal ?? "null"})`;
+			this.exitReason = reason;
 			this.rejectReady(new Error(reason));
 			this.startedReject?.(new Error(reason));
 			this.startedReject = null;
@@ -198,6 +258,11 @@ export class LinuxNativeCaptureSession {
 			}
 			this.stoppedResolve = null;
 			this.stoppedReject = null;
+			if (this.capturing && !this.stopRequested) {
+				this.diedMidTake = true;
+				console.error(`[capture-linux] the helper died mid-take: ${reason}`);
+				this.onInterrupted?.();
+			}
 		});
 		child.once("error", (error) => {
 			this.process = null;
@@ -232,6 +297,11 @@ export class LinuxNativeCaptureSession {
 		if (this.sourceSelected) {
 			return Promise.resolve();
 		}
+		// `ready` and the error can share one stdout chunk, both read before the caller
+		// gets to wait: the cancel must still reach it, not the exit that follows.
+		if (this.sourceSelectionError) {
+			return Promise.reject(this.sourceSelectionError);
+		}
 		if (!this.process) {
 			return Promise.reject(new Error("The Linux capture helper is not running."));
 		}
@@ -247,13 +317,25 @@ export class LinuxNativeCaptureSession {
 	 * Safe to call on a session that was not deferred (the helper ignores the
 	 * verb) and safe to call twice, so a caller never has to track whether a
 	 * prepare happened.
+	 *
+	 * Armed right after the portal's picker was answered, the release waits until
+	 * the picker has left the screen (see [`PICKER_CLOSE_MS`]). After a countdown
+	 * that wait is long over. Direct X11, which names its `source`, has no picker.
 	 */
 	arm() {
 		if (this.armed) {
 			return;
 		}
 		this.armed = true;
-		this.write("record");
+		const wait =
+			this.config.source || !this.sourceSelected
+				? 0
+				: this.sourceSelectedAtMs + PICKER_CLOSE_MS - Date.now();
+		if (wait <= 0) {
+			this.write("record");
+			return;
+		}
+		setTimeout(() => this.write("record"), wait);
 	}
 
 	/**
@@ -340,6 +422,11 @@ export class LinuxNativeCaptureSession {
 		this.cursorPauseStartedAtMs = null;
 	}
 
+	/** Epoch used by both helper cursor samples and cursorPauseRanges. */
+	get cursorStartTimeMs(): number {
+		return this.cursorRecordingStartMs;
+	}
+
 	get isPaused() {
 		return this.paused;
 	}
@@ -354,6 +441,46 @@ export class LinuxNativeCaptureSession {
 	 */
 	get grantedSourceKind(): LinuxCaptureSourceKind | undefined {
 		return this.sourceKind;
+	}
+
+	/** Portal origin in compositor space; stream dimensions are separately in pixels. */
+	get grantedCaptureOrigin(): { x: number; y: number } | null {
+		if (typeof this.captureOriginX === "number" && typeof this.captureOriginY === "number") {
+			return { x: this.captureOriginX, y: this.captureOriginY };
+		}
+		return null;
+	}
+
+	/** Size alone, when the helper reported dimensions but not a complete origin. */
+	get grantedCaptureSize(): { width: number; height: number } | null {
+		if (typeof this.captureWidth === "number" && typeof this.captureHeight === "number") {
+			return { width: this.captureWidth, height: this.captureHeight };
+		}
+		return null;
+	}
+
+	private rememberCaptureBounds(payload: {
+		positionX?: number | null;
+		positionY?: number | null;
+		width?: number;
+		height?: number;
+	}) {
+		if (typeof payload.positionX === "number" && Number.isFinite(payload.positionX)) {
+			this.captureOriginX = payload.positionX;
+		}
+		if (typeof payload.positionY === "number" && Number.isFinite(payload.positionY)) {
+			this.captureOriginY = payload.positionY;
+		}
+		if (typeof payload.width === "number" && Number.isFinite(payload.width) && payload.width > 0) {
+			this.captureWidth = payload.width;
+		}
+		if (
+			typeof payload.height === "number" &&
+			Number.isFinite(payload.height) &&
+			payload.height > 0
+		) {
+			this.captureHeight = payload.height;
+		}
 	}
 
 	/**
@@ -397,46 +524,98 @@ export class LinuxNativeCaptureSession {
 	 * MP4's moov atom is written during teardown, and returning a path to a file
 	 * whose index is still being written would hand the app an unplayable
 	 * recording.
+	 *
+	 * A helper that died first, or during the stop, never says `capture-stopped`.
+	 * Its file is fragmented MP4, so what it wrote up to its last whole fragment
+	 * still opens: that part is returned with `interrupted` set, as macOS and
+	 * Windows keep theirs. Only a file with no usable frame is deleted and thrown.
 	 */
 	async stop(): Promise<LinuxCaptureResult> {
+		this.stopRequested = true;
 		const child = this.process;
-		if (!child) {
-			if (this.stopped) {
-				return this.stopped;
-			}
-			throw new Error("The Linux capture helper is not running.");
-		}
-
+		let failure: unknown = null;
 		this.completeCursorPauseRange();
-		const exited = new Promise<void>((resolve, reject) => {
-			this.stoppedResolve = resolve;
-			this.stoppedReject = reject;
+		if (child) {
+			const exited = new Promise<void>((resolve, reject) => {
+				this.stoppedResolve = resolve;
+				this.stoppedReject = reject;
+			});
+			this.write("stop");
+			try {
+				child.stdin.end();
+			} catch {
+				// Already closed if the helper died on its own; the exit handler runs.
+			}
+
+			const timer = setTimeout(() => {
+				console.error("[capture-linux] helper did not exit in time; terminating");
+				this.kill();
+			}, STOP_TIMEOUT_MS);
+			try {
+				await exited;
+			} catch (error) {
+				failure = error;
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+
+		if (this.stopped) {
+			return this.stopped;
+		}
+		// The helper has exited on every path that reaches here, so nothing writes the
+		// file any more and cutting off a torn tail is safe.
+		return this.recoverInterruptedTake(
+			failure ?? new Error(this.exitReason ?? "The Linux capture helper produced no output file."),
+		);
+	}
+
+	private async recoverInterruptedTake(failure: unknown): Promise<LinuxCaptureResult> {
+		const outputPath = this.config.outputPath;
+		const salvage = await salvageNativeMacCapture(outputPath);
+		if (!salvage.ok) {
+			console.error("[capture-linux] nothing recoverable in the interrupted take", {
+				failure: String(failure),
+				reason: salvage.reason,
+			});
+			await fs.rm(outputPath, { force: true }).catch(() => undefined);
+			throw failure instanceof Error ? failure : new Error(String(failure));
+		}
+		console.warn("[capture-linux] recovered the part of the take written before the helper died", {
+			failure: String(failure),
+			path: salvage.screenVideoPath,
+			videoSamples: salvage.videoSamples,
+			durationSec: salvage.durationSec,
+			truncatedBytes: salvage.truncatedBytes,
 		});
-		this.write("stop");
-		try {
-			child.stdin.end();
-		} catch {
-			// Already closed if the helper died on its own; the exit handler runs.
-		}
-
-		const timer = setTimeout(() => {
-			console.error("[capture-linux] helper did not exit in time; terminating");
-			this.kill();
-		}, STOP_TIMEOUT_MS);
-		try {
-			await exited;
-		} finally {
-			clearTimeout(timer);
-		}
-
-		if (!this.stopped) {
-			throw new Error(this.lastError ?? "The Linux capture helper produced no output file.");
-		}
+		this.stopped = {
+			path: salvage.screenVideoPath,
+			durationMs: Math.round(salvage.durationSec * 1000),
+			frames: salvage.videoSamples,
+			droppedFrames: 0,
+			cursor: compactCursorTelemetryPauseRanges(
+				this.cursor.toRecordingData(),
+				this.cursorPauseRanges,
+			),
+			cursorPauseRanges: this.cursorPauseRanges.slice(),
+			...(this.sourceKind ? { sourceKind: this.sourceKind } : {}),
+			...(this.videoEncoder ? { videoEncoder: this.videoEncoder } : {}),
+			...(this.audioLost ? { audioLost: true as const } : {}),
+			// A helper that fails while stopping on the user's Stop still keeps its take,
+			// but the user stopped it: no "stopped unexpectedly" warning.
+			...(this.diedMidTake ? { interrupted: true as const } : {}),
+		};
 		return this.stopped;
+	}
+
+	/** The helper exited mid-take before anyone asked it to stop. */
+	get interrupted() {
+		return this.diedMidTake;
 	}
 
 	/** Kills the helper and discards whatever it wrote. */
 	discard() {
+		this.stopRequested = true;
 		this.kill();
 	}
 
@@ -488,10 +667,12 @@ export class LinuxNativeCaptureSession {
 				return;
 
 			case "source-selected":
+				this.rememberCaptureBounds(payload);
 				if (payload.sourceKind) {
 					this.sourceKind = payload.sourceKind;
 				}
 				this.sourceSelected = true;
+				this.sourceSelectedAtMs = Date.now();
 				console.info(
 					"[capture-linux] source selected",
 					JSON.stringify({ sourceKind: payload.sourceKind ?? null }),
@@ -503,6 +684,7 @@ export class LinuxNativeCaptureSession {
 				return;
 
 			case "stream-started":
+				this.rememberCaptureBounds(payload);
 				if (payload.sourceKind) {
 					this.sourceKind = payload.sourceKind;
 				}
@@ -516,6 +698,8 @@ export class LinuxNativeCaptureSession {
 					JSON.stringify({
 						width: payload.width,
 						height: payload.height,
+						positionX: payload.positionX ?? null,
+						positionY: payload.positionY ?? null,
 						sourceKind: payload.sourceKind ?? null,
 					}),
 				);
@@ -579,8 +763,10 @@ export class LinuxNativeCaptureSession {
 						this.cursor.toRecordingData(),
 						this.cursorPauseRanges,
 					),
+					cursorPauseRanges: this.cursorPauseRanges.slice(),
 					...(this.sourceKind ? { sourceKind: this.sourceKind } : {}),
 					...(this.videoEncoder ? { videoEncoder: this.videoEncoder } : {}),
+					...(this.audioLost ? { audioLost: true as const } : {}),
 				};
 				console.info(
 					"[capture-linux] capture stopped",
@@ -597,18 +783,28 @@ export class LinuxNativeCaptureSession {
 
 			case "warning":
 				console.warn(`[capture-linux] ${payload.code}: ${payload.message}`);
+				// Only a lost audio track is the user's business. The rest, such as a frame
+				// Mutter marks corrupted (most Wayland takes have one), are dropped frames
+				// the take survives, and their text is for the log.
+				if (payload.code === "audio-unavailable") {
+					this.audioLost = true;
+				}
 				return;
 
-			case "error":
+			case "error": {
 				console.error(`[capture-linux] ${payload.code}: ${payload.message}`);
 				// Kept so the process-exit handler can report the CAUSE rather
 				// than just the exit code, which on its own says nothing useful.
 				this.lastError = payload.message;
-				this.rejectReady(new Error(payload.message));
-				this.sourceSelectedReject?.(new Error(payload.message));
+				// The code rides along so a dismissed picker is not read as a failure.
+				const error = Object.assign(new Error(payload.message), { code: payload.code });
+				this.rejectReady(error);
+				if (!this.sourceSelected) this.sourceSelectionError ??= error;
+				this.sourceSelectedReject?.(error);
 				this.sourceSelectedReject = null;
 				this.sourceSelectedResolve = null;
 				return;
+			}
 
 			case "debug":
 				console.info("[capture-linux][debug]", JSON.stringify(payload));

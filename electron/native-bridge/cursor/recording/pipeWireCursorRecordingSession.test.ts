@@ -33,7 +33,13 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { spawn } from "node:child_process";
-import { PipeWireCursorRecordingSession } from "./pipeWireCursorRecordingSession";
+import { createCursorRecordingSession } from "./factory";
+import {
+	findLinuxCaptureHelperPath,
+	findPipeWireCursorHelperPath,
+	PipeWireCursorRecordingSession,
+} from "./pipeWireCursorRecordingSession";
+import { TelemetryRecordingSession } from "./telemetryRecordingSession";
 
 /** Minimal stand-in for the helper process: stdio pipes plus kill bookkeeping. */
 class FakeHelper extends EventEmitter {
@@ -93,7 +99,13 @@ function flushStdout() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+const realPlatform = process.platform;
+
 beforeEach(() => {
+	// The cursor-only session is Wayland's alone (#1491); pin one for the session tests.
+	Object.defineProperty(process, "platform", { value: "linux" });
+	vi.stubEnv("XDG_SESSION_TYPE", "wayland");
+	vi.stubEnv("WAYLAND_DISPLAY", undefined);
 	helper = new FakeHelper();
 	spawnMock.mockReset();
 	spawnMock.mockReturnValue(helper as unknown as ReturnType<typeof spawn>);
@@ -107,6 +119,31 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
+	Object.defineProperty(process, "platform", { value: realPlatform });
+});
+
+describe("X11 session (#1491)", () => {
+	const cursorOptions = {
+		getDisplayBounds: () => null,
+		maxSamples: 100,
+		platform: "linux" as const,
+		sampleIntervalMs: 33,
+	};
+
+	it("finds the portal helper in a Wayland session", () => {
+		expect(findPipeWireCursorHelperPath()).not.toBeNull();
+		expect(createCursorRecordingSession(cursorOptions)).toBeInstanceOf(
+			PipeWireCursorRecordingSession,
+		);
+	});
+
+	it("keeps the portal's cursor session off X11, where the take still finds the helper", () => {
+		vi.stubEnv("XDG_SESSION_TYPE", "x11");
+		expect(findLinuxCaptureHelperPath()).not.toBeNull();
+		expect(findPipeWireCursorHelperPath()).toBeNull();
+		expect(createCursorRecordingSession(cursorOptions)).toBeInstanceOf(TelemetryRecordingSession);
+	});
 });
 
 describe("PipeWireCursorRecordingSession", () => {

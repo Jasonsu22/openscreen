@@ -10,10 +10,12 @@ import type { NativePlatform } from "@/native/contracts";
 import { TooltipProvider } from "../ui/tooltip";
 import {
 	HUD_BAR_BOTTOM,
+	HUD_EDGE_SLACK,
 	HUD_POPOVER_GAP,
 	HUD_POPOVER_MAX_HEIGHT,
 	HUD_STACK_GAP,
 	HUD_TOAST_WIDTH,
+	HUD_TOOLTIP_STACK_HEIGHT,
 	HUD_UNREPORTED_PANELS_ALLOWANCE,
 } from "./hudGeometry";
 import { LaunchWindow } from "./LaunchWindow";
@@ -74,6 +76,7 @@ const recorderState = vi.hoisted(() => ({
 		setSystemAudioEnabled: vi.fn(),
 		cursorCaptureMode: "editable-overlay",
 		setCursorCaptureMode: vi.fn(),
+		presenterOverlay: null as { active: boolean; cameraInterrupted: boolean } | null,
 		softwareEncoderFallbackNoticeVisible: false,
 		dismissSoftwareEncoderFallbackNotice: vi.fn(),
 		recordingPrefsLoaded: true,
@@ -361,6 +364,7 @@ function resetLaunchMocks() {
 	recorderState.value.setCursorCaptureMode.mockClear();
 	recorderState.value.softwareEncoderFallbackNoticeVisible = false;
 	recorderState.value.dismissSoftwareEncoderFallbackNotice.mockClear();
+	recorderState.value.presenterOverlay = null;
 	recorderState.value.recording = false;
 	recorderState.value.canPauseRecording = false;
 	recorderState.value.microphoneEnabled = false;
@@ -763,6 +767,17 @@ describe("LaunchWindow record button", () => {
 		renderLaunchWindow();
 
 		expect(await screen.findByTestId("launch-cursor-mode-button")).toBeInTheDocument();
+	});
+
+	it("offers Notes on Linux, which opens the Notes window", async () => {
+		platformState.value = "linux";
+		renderLaunchWindow();
+		// The cursor toggle waits for the platform answer, so Notes is checked after it.
+		await screen.findByTestId("launch-cursor-mode-button");
+
+		const notes = screen.getByRole("button", { name: "Open Notes: text to read while you record" });
+		fireEvent.click(notes);
+		expect(window.electronAPI.openNotes).toHaveBeenCalled();
 	});
 
 	it("waits for the native helper's answer before offering the cursor toggle", async () => {
@@ -1284,6 +1299,108 @@ describe("LaunchWindow overlay sizing", () => {
 		expect(height).toBeGreaterThanOrEqual(
 			HUD_BAR_BOTTOM + 56 + HUD_POPOVER_GAP + HUD_POPOVER_MAX_HEIGHT,
 		);
+	});
+
+	it("grants the bar no growth reserve on Linux", async () => {
+		platformState.value = "linux";
+		renderLaunchWindow();
+
+		const bar = (await screen.findByTestId("hud-drag-handle")).closest(
+			"[data-tray-layout]",
+		) as HTMLElement;
+		stubBox(bar, 400, 56);
+		await flushResizeObservers();
+
+		await waitFor(() => {
+			expect(window.electronAPI.setHudOverlaySize).toHaveBeenCalled();
+		});
+
+		const [width, height] = lastRequestedHudSize();
+		// The bar plus the edge slack, and nothing more: on Linux the HUD is not
+		// click-through, so extra width is a transparent dead zone around the bar.
+		expect(width).toBe(400 + HUD_EDGE_SLACK * 2);
+		// The height keeps room for the tallest tooltip (portalled, so never measured)
+		// and nothing for the panels that are not open.
+		expect(height).toBe(HUD_BAR_BOTTOM + 56 + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK);
+	});
+
+	it("shrinks back to the bar on Linux once a wider bar narrows", async () => {
+		platformState.value = "linux";
+		renderLaunchWindow();
+
+		const bar = (await screen.findByTestId("hud-drag-handle")).closest(
+			"[data-tray-layout]",
+		) as HTMLElement;
+		stubBox(bar, 520, 56);
+		await flushResizeObservers();
+		await waitFor(() => {
+			expect(lastRequestedHudSize()[0]).toBe(520 + HUD_EDGE_SLACK * 2);
+		});
+
+		stubBox(bar, 400, 56);
+		await flushResizeObservers();
+		// No shrink threshold without a reserve: the window follows the bar down
+		// instead of keeping a click-blocking margin.
+		expect(lastRequestedHudSize()[0]).toBe(400 + HUD_EDGE_SLACK * 2);
+	});
+
+	it("grows for an open panel on Linux and shrinks back once it closes", async () => {
+		platformState.value = "linux";
+		renderLaunchWindow();
+
+		const bar = (await screen.findByTestId("hud-drag-handle")).closest(
+			"[data-tray-layout]",
+		) as HTMLElement;
+		const anchor = bar.parentElement as HTMLElement;
+		const collapsed = HUD_BAR_BOTTOM + 56 + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK;
+		stubBox(bar, 400, 56);
+		await flushResizeObservers();
+		expect(lastRequestedHudSize()[1]).toBe(collapsed);
+
+		// A 300px panel open above the bar: the window follows its measured height,
+		// so the space is there while the panel is and gone when it is not.
+		const stack = 56 + HUD_POPOVER_GAP + 300;
+		stubBox(anchor, 400, stack);
+		await flushResizeObservers();
+		expect(lastRequestedHudSize()[1]).toBe(HUD_BAR_BOTTOM + stack + HUD_EDGE_SLACK);
+
+		stubBox(anchor, 400, 56);
+		await flushResizeObservers();
+		expect(lastRequestedHudSize()[1]).toBe(collapsed);
+	});
+
+	it("counts a toast in the Linux window height and gives the room back", async () => {
+		platformState.value = "linux";
+		renderLaunchWindow();
+
+		const bar = (await screen.findByTestId("hud-drag-handle")).closest(
+			"[data-tray-layout]",
+		) as HTMLElement;
+		stubBox(bar, 400, 56);
+		await flushResizeObservers();
+		const collapsed = HUD_BAR_BOTTOM + 56 + HUD_TOOLTIP_STACK_HEIGHT + HUD_EDGE_SLACK;
+		expect(lastRequestedHudSize()[1]).toBe(collapsed);
+
+		act(() => {
+			toast.error("Not enough disk space to start recording (only 298 MB free).");
+		});
+		const text = await screen.findByText(/Not enough disk space/);
+		const list = text.closest("[data-sonner-toaster]") as HTMLElement;
+		// Sonner writes the front toast's height on its list once it has measured it;
+		// jsdom has no layout, so the measurement is written here.
+		act(() => {
+			list.style.setProperty("--front-toast-height", "64px");
+		});
+		await waitFor(() => {
+			expect(lastRequestedHudSize()[1]).toBe(collapsed + HUD_STACK_GAP + 64);
+		});
+
+		act(() => {
+			toast.dismiss();
+		});
+		await waitFor(() => {
+			expect(lastRequestedHudSize()[1]).toBe(collapsed);
+		});
 	});
 
 	it("reclaims the overlay once the content drops well below what was granted", async () => {
@@ -2239,6 +2356,75 @@ describe("LaunchWindow software encoder fallback notice", () => {
 		expect(recorderState.value.dismissSoftwareEncoderFallbackNotice).toHaveBeenCalledTimes(1);
 		expect(recorderState.value.dismissSoftwareEncoderFallbackNotice).toHaveBeenCalledWith(true);
 	});
+
+	it("leaves Enter alone", async () => {
+		recorderState.value.softwareEncoderFallbackNoticeVisible = true;
+
+		renderLaunchWindow();
+		await screen.findByRole("button", { name: "Got it" });
+		fireEvent.keyDown(document.body, { key: "Enter" });
+
+		expect(recorderState.value.dismissSoftwareEncoderFallbackNotice).not.toHaveBeenCalled();
+	});
+});
+
+// #1428: the prompt's buttons need the mouse, and a window with nothing focused took Enter nowhere.
+describe("LaunchWindow system language prompt", () => {
+	beforeEach(() => {
+		platformState.value = "win32";
+		resetLaunchMocks();
+		i18nState.value.systemLocaleSuggestion = "zh-CN";
+	});
+
+	afterEach(() => {
+		cleanup();
+		vi.unstubAllGlobals();
+	});
+
+	it("accepts the suggestion on Enter while no control has focus", async () => {
+		renderLaunchWindow();
+		await screen.findByRole("button", { name: "Switch to English" });
+
+		fireEvent.keyDown(document.body, { key: "Enter" });
+
+		expect(i18nState.value.acceptSystemLocaleSuggestion).toHaveBeenCalledTimes(1);
+		expect(i18nState.value.dismissSystemLocaleSuggestion).not.toHaveBeenCalled();
+	});
+
+	it("leaves Enter to a control that has focus", async () => {
+		renderLaunchWindow();
+		const keep = await screen.findByRole("button", { name: "Keep current language" });
+		const user = userEvent.setup();
+
+		keep.focus();
+		await user.keyboard("{Enter}");
+
+		expect(i18nState.value.dismissSystemLocaleSuggestion).toHaveBeenCalledTimes(1);
+		expect(i18nState.value.acceptSystemLocaleSuggestion).not.toHaveBeenCalled();
+	});
+
+	it("ignores a held Enter, and other keys", async () => {
+		renderLaunchWindow();
+		await screen.findByRole("button", { name: "Switch to English" });
+
+		fireEvent.keyDown(document.body, { key: "Enter", repeat: true });
+		fireEvent.keyDown(document.body, { key: " " });
+		fireEvent.keyDown(document.body, { key: "Enter", ctrlKey: true });
+		fireEvent.keyDown(document.body, { key: "Enter", altKey: true });
+		fireEvent.keyDown(document.body, { key: "Enter", shiftKey: true });
+		fireEvent.keyDown(document.body, { key: "Enter", metaKey: true });
+
+		expect(i18nState.value.acceptSystemLocaleSuggestion).not.toHaveBeenCalled();
+	});
+
+	it("leaves Enter alone while a popover is open", async () => {
+		renderLaunchWindow();
+		fireEvent.click(await screen.findByRole("button", { name: "Language: English" }));
+
+		fireEvent.keyDown(document.body, { key: "Enter" });
+
+		expect(i18nState.value.acceptSystemLocaleSuggestion).not.toHaveBeenCalled();
+	});
 });
 
 // #1149: sonner's default corner of the HUD window is where the bar is, so a toast covered
@@ -2372,5 +2558,99 @@ describe("LaunchWindow toasts", () => {
 				height: 480,
 			});
 		});
+	});
+	it("does not show an informational notice when only the system overlay is active", () => {
+		recorderState.value.recording = true;
+		recorderState.value.presenterOverlay = { active: true, cameraInterrupted: false };
+		renderLaunchWindow();
+		expect(screen.queryByTestId("presenter-overlay-notice")).not.toBeInTheDocument();
+	});
+
+	it("keeps the camera warning visible after the system overlay stops", async () => {
+		recorderState.value.recording = true;
+		recorderState.value.presenterOverlay = { active: false, cameraInterrupted: true };
+		renderLaunchWindow();
+		await waitFor(() =>
+			expect(screen.getByTestId("presenter-overlay-notice")).toHaveTextContent(
+				"presenterOverlay.interruptedDescription",
+			),
+		);
+		expect(recorderState.value.toggleRecording).not.toHaveBeenCalled();
+		expect(recorderState.value.cancelRecording).not.toHaveBeenCalled();
+	});
+
+	it("does not keep the in-take warning after recording ends", () => {
+		recorderState.value.presenterOverlay = { active: false, cameraInterrupted: true };
+		renderLaunchWindow();
+		expect(screen.queryByTestId("presenter-overlay-notice")).not.toBeInTheDocument();
+	});
+});
+
+describe("floating camera preview control", () => {
+	beforeEach(() => {
+		platformState.value = "darwin";
+		resetLaunchMocks();
+	});
+
+	it("keeps hide/show available during recording without changing camera capture", () => {
+		recorderState.value.webcamEnabled = true;
+		recorderState.value.recording = true;
+		renderLaunchWindow();
+		const button = screen.getByTestId("launch-camera-preview-button");
+		expect(button).toHaveAttribute("aria-pressed", "true");
+		fireEvent.click(button);
+		expect(button).toHaveAttribute("aria-pressed", "false");
+		fireEvent.click(button);
+		expect(button).toHaveAttribute("aria-pressed", "true");
+		expect(recorderState.value.setWebcamEnabled).not.toHaveBeenCalled();
+	});
+
+	it("hides the preview control when the camera is off", () => {
+		const view = renderLaunchWindow();
+		expect(screen.queryByTestId("launch-camera-preview-button")).not.toBeInTheDocument();
+		recorderState.value.webcamEnabled = true;
+		view.rerender(
+			<TooltipProvider>
+				<LaunchWindow />
+			</TooltipProvider>,
+		);
+		expect(screen.getByTestId("launch-camera-preview-button")).toHaveAttribute(
+			"aria-pressed",
+			"true",
+		);
+		recorderState.value.webcamEnabled = false;
+		view.rerender(
+			<TooltipProvider>
+				<LaunchWindow />
+			</TooltipProvider>,
+		);
+		expect(screen.queryByTestId("launch-camera-preview-button")).not.toBeInTheDocument();
+	});
+
+	it("hides the preview control while a take cannot exclude the preview", async () => {
+		platformState.value = "linux";
+		recorderState.value.webcamEnabled = true;
+		const original = window.electronAPI.onCameraPreviewAvailability;
+		window.electronAPI.onCameraPreviewAvailability = (callback) => {
+			callback(false);
+			return () => undefined;
+		};
+		try {
+			renderLaunchWindow();
+			await waitFor(() =>
+				expect(screen.queryByTestId("launch-camera-preview-button")).not.toBeInTheDocument(),
+			);
+		} finally {
+			window.electronAPI.onCameraPreviewAvailability = original;
+		}
+	});
+
+	it.each(["win32", "linux"] as const)("offers the preview on %s", async (platform) => {
+		platformState.value = platform;
+		recorderState.value.webcamEnabled = true;
+		renderLaunchWindow();
+		await waitFor(() =>
+			expect(screen.getByTestId("launch-camera-preview-button")).toBeInTheDocument(),
+		);
 	});
 });

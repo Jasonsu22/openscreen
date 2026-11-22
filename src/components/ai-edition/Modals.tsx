@@ -4,16 +4,36 @@ import {
 	type ReactNode,
 	type PointerEvent as ReactPointerEvent,
 	useEffect,
+	useId,
 	useRef,
 	useState,
 } from "react";
 import type { CropRegion } from "@/components/video-editor/types";
 import { useScopedT } from "@/contexts/I18nContext";
+import { type ClipRotation, clipRotation, turnCropRegion } from "@/lib/ai-edition/clipRotation";
 import type { AxcutClip } from "@/lib/ai-edition/schema";
 import { formatSeconds } from "@/lib/ai-edition/timeline/format";
-import { cropDraftFromRegion, cropDraftToPct, previewBoxStyle } from "./cropDraft";
+import type {
+	AiEditionProjectRecordingsResult,
+	AiEditionRecordingsDisposal,
+} from "@/native/contracts";
+import { formatBytes } from "@/utils/formatBytes";
+import { getPlatform } from "@/utils/platformUtils";
+import {
+	type CropField,
+	type CropPct,
+	cropDraftFromRegion,
+	cropDraftToPct,
+	cropFieldRangePx,
+	cropPctToPx,
+	type FrameSize,
+	isUsableFrameSize,
+	MIN_CROP_PCT,
+	previewBoxStyle,
+	setCropFieldPx,
+} from "./cropDraft";
 import styles from "./NewEditorShell.module.css";
-import { ChoiceRow } from "./RightPanes";
+import { ChoiceRow, Toggle } from "./RightPanes";
 import type { VideoSource } from "./VirtualPreview";
 
 interface BaseModalProps {
@@ -71,7 +91,10 @@ export function ModalShell({
 		// the dialog mounts), in which case restoring is a no-op; the panel's gear is still
 		// there, and gets it back.
 		const opener = document.activeElement;
-		dialogRef.current?.focus();
+		// A dialog whose first act is typing marks its field `data-autofocus`. React's own
+		// `autoFocus` loses: it fires before this effect, which then took the focus back.
+		const dialog = dialogRef.current;
+		(dialog?.querySelector<HTMLElement>("[data-autofocus]") ?? dialog)?.focus();
 		return () => {
 			if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
 		};
@@ -124,7 +147,12 @@ interface OpenProjectModalProps extends BaseModalProps {
 	projects: ProjectItem[];
 	activeProjectId: string | null;
 	onSelect: (id: string) => void;
-	onDelete: (id: string) => void;
+	onDelete: (
+		id: string,
+		recordings: AiEditionRecordingsDisposal,
+	) => Promise<{ trashFailed?: boolean } | undefined>;
+	/** The recordings deleting `id` could also remove. */
+	loadRecordings: (id: string) => Promise<AiEditionProjectRecordingsResult>;
 	onBrowse: () => void;
 }
 
@@ -135,6 +163,7 @@ export function OpenProjectModal({
 	activeProjectId,
 	onSelect,
 	onDelete,
+	loadRecordings,
 	onBrowse,
 }: OpenProjectModalProps) {
 	const t = useScopedT("editor");
@@ -144,9 +173,50 @@ export function OpenProjectModal({
 	// confirm on its own row instead of deleting on the first click. One row at a
 	// time, and closing the dialog disarms it.
 	const [confirmId, setConfirmId] = useState<string | null>(null);
+	const [recordings, setRecordings] = useState<AiEditionProjectRecordingsResult | null>(null);
+	const [trashRecordings, setTrashRecordings] = useState(false);
+	const [trashFailed, setTrashFailed] = useState(false);
+	const [deleting, setDeleting] = useState(false);
+	const armedIdRef = useRef<string | null>(null);
+	const arm = (id: string | null) => {
+		armedIdRef.current = id;
+		setConfirmId(id);
+		setRecordings(null);
+		setTrashRecordings(false);
+		setTrashFailed(false);
+		// The open project's take is held by the preview: Windows refuses to move it, after its
+		// sidecars are already gone. Its recordings are kept, and the row says so.
+		if (!id || id === activeProjectId) return;
+		void loadRecordings(id)
+			.then((result) => {
+				if (armedIdRef.current === id && result.success) setRecordings(result);
+			})
+			// Without the answer the row offers no toggle, and the delete keeps the recordings.
+			.catch(() => undefined);
+	};
+	// biome-ignore lint/correctness/useExhaustiveDependencies: disarm only when the dialog closes
 	useEffect(() => {
-		if (!open) setConfirmId(null);
+		if (!open) arm(null);
 	}, [open]);
+	const recycleBin = getPlatform() === "win32";
+	const confirmDelete = async (id: string) => {
+		const disposal: AiEditionRecordingsDisposal = trashFailed
+			? "permanent"
+			: trashRecordings && recordings && recordings.count > 0
+				? "trash"
+				: "keep";
+		setDeleting(true);
+		try {
+			const result = await onDelete(id, disposal);
+			if (result?.trashFailed) {
+				setTrashFailed(true);
+				return;
+			}
+			arm(null);
+		} finally {
+			setDeleting(false);
+		}
+	};
 	const filtered = projects.filter((p) => p.title.toLowerCase().includes(query.toLowerCase()));
 	// The row ↑↓ moved to, or null for the default: the open project, or the first match once a
 	// search narrows the list. Enter opens it, as the footer says (#1135).
@@ -198,6 +268,7 @@ export function OpenProjectModal({
 				<FolderOpen size={14} style={{ color: "var(--muted)" }} />
 				<input
 					type="search"
+					data-autofocus
 					placeholder={t("openProjectDialog.searchPlaceholder")}
 					value={query}
 					onChange={(e) => setQuery(e.target.value)}
@@ -261,26 +332,86 @@ export function OpenProjectModal({
 												marginTop: 2,
 											}}
 										>
-											{t("openProjectDialog.confirmDelete")}
+											{trashFailed
+												? t(
+														recycleBin
+															? "openProjectDialog.recycleFailed"
+															: "openProjectDialog.trashFailed",
+													)
+												: recordings && recordings.count > 0
+													? t("openProjectDialog.confirmDeleteProject")
+													: t("openProjectDialog.confirmDelete")}
 										</div>
+										{!trashFailed && recordings && recordings.count > 0 ? (
+											<div
+												style={{
+													display: "flex",
+													alignItems: "center",
+													gap: 8,
+													marginTop: 8,
+													font: "400 12px/1.4 var(--font-body)",
+												}}
+											>
+												<Toggle
+													checked={trashRecordings}
+													onChange={setTrashRecordings}
+													ariaLabel={t(
+														recycleBin
+															? "openProjectDialog.alsoRecycle"
+															: "openProjectDialog.alsoTrash",
+														{ size: formatBytes(recordings.sizeBytes) },
+													)}
+												/>
+												<span>
+													{t(
+														recycleBin
+															? "openProjectDialog.alsoRecycle"
+															: "openProjectDialog.alsoTrash",
+														{ size: formatBytes(recordings.sizeBytes) },
+													)}
+												</span>
+											</div>
+										) : null}
+										{!trashFailed && recordings && recordings.keptFor.length > 0 ? (
+											<div
+												style={{
+													font: "400 12px/1.4 var(--font-body)",
+													color: "var(--muted)",
+													marginTop: 4,
+												}}
+											>
+												{t("openProjectDialog.recordingsKeptFor", {
+													projects: recordings.keptFor.join(", "),
+												})}
+											</div>
+										) : null}
+										{!trashFailed && recordings && recordings.unreadable > 0 ? (
+											<div
+												style={{
+													font: "400 12px/1.4 var(--font-body)",
+													color: "var(--muted)",
+													marginTop: 4,
+												}}
+											>
+												{t("openProjectDialog.recordingsKeptUnreadable")}
+											</div>
+										) : null}
 									</div>
 									<button
 										type="button"
 										className={`${styles.btn} ${styles.btnSecondary}`}
-										onClick={() => setConfirmId(null)}
+										onClick={() => arm(null)}
 									>
 										{tc("actions.cancel")}
 									</button>
 									<button
 										type="button"
 										className={`${styles.btn} ${styles.dangerBtn}`}
-										onClick={() => {
-											setConfirmId(null);
-											onDelete(p.id);
-										}}
+										disabled={deleting}
+										onClick={() => void confirmDelete(p.id)}
 									>
 										<Trash2 size={14} />
-										{tc("actions.delete")}
+										{trashFailed ? t("openProjectDialog.deletePermanently") : tc("actions.delete")}
 									</button>
 								</div>
 							);
@@ -360,7 +491,7 @@ export function OpenProjectModal({
 								<button
 									type="button"
 									className={styles.iconBtn}
-									onClick={() => setConfirmId(p.id)}
+									onClick={() => arm(p.id)}
 									title={t("openProjectDialog.deleteProject")}
 									aria-label={t("openProjectDialog.deleteProject")}
 								>
@@ -614,11 +745,10 @@ function centeredFitPct(fr: number): { x: number; y: number; w: number; h: numbe
 	return { x: (100 - w) / 2, y: 0, w, h: 100 };
 }
 
-const MIN_PCT = 4;
+const MIN_PCT = MIN_CROP_PCT;
 const clampPct = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 type ResizeEdges = { left?: boolean; right?: boolean; top?: boolean; bottom?: boolean };
-type CropPct = { x: number; y: number; w: number; h: number };
 
 /** `start` with its `edges` moved by (dxPct, dyPct), kept inside the frame. With a locked
  *  fraction-space ratio `fr`, the opposite dimension follows to keep width/height locked. */
@@ -685,14 +815,26 @@ export interface AssetMeta {
 
 const IDENTITY_CROP: CropRegion = { x: 0, y: 0, width: 1, height: 1 };
 
+// The clip's stored crop as the dialog shows it: on the turned picture for a turned clip.
+function shownCropRegion(clip: AxcutClip): CropRegion {
+	const region = clip.cropRegion ?? IDENTITY_CROP;
+	return clipRotation(clip) === 180 ? turnCropRegion(region) : region;
+}
+
 interface EditClipModalProps extends BaseModalProps {
 	clip: AxcutClip | null;
 	assetMeta: AssetMeta | null;
 	videoSources: VideoSource[];
 	/** `cropRegion` is `undefined` when the crop section wasn't touched (Reset
 	 * back to the clip's stored value) — the caller can skip the write in that
-	 * case — and `null` when the user explicitly reset it to "no crop". */
-	onApply: (sourceStartSec: number, sourceEndSec: number, cropRegion?: CropRegion | null) => void;
+	 * case — and `null` when the user explicitly reset it to "no crop". `rotation` is
+	 * `undefined` when it was left as stored. */
+	onApply: (
+		sourceStartSec: number,
+		sourceEndSec: number,
+		cropRegion?: CropRegion | null,
+		rotation?: ClipRotation,
+	) => void;
 }
 
 // Mirrors Axcut's ClipEditDialog: an embedded preview of just this clip plus
@@ -726,11 +868,15 @@ export function EditClipModal({
 	const [cropHPct, setCropHPct] = useState(100);
 	const [cropRatio, setCropRatio] = useState("free");
 	const [cropTouched, setCropTouched] = useState(false);
+	// The crop draft is kept as the dialog shows it: on the turned picture when this is 180.
+	const [draftRotation, setDraftRotation] = useState<ClipRotation>(0);
 	// Source video's real pixel aspect ratio (width/height) — needed to convert
 	// between a preset's visual ratio (e.g. 16/9) and the crop region's
 	// fraction-of-frame width/height. 16/9 is just a placeholder until the
 	// crop <video>'s real metadata loads (see the effect below).
 	const [videoAspectRatio, setVideoAspectRatio] = useState(16 / 9);
+	// The same frame in pixels, for the X / Y / Width / Height fields. Null until the metadata loads.
+	const [videoSize, setVideoSize] = useState<FrameSize | null>(null);
 	const cropFrameRef = useRef<HTMLDivElement | null>(null);
 	const cropVideoRef = useRef<HTMLVideoElement | null>(null);
 	// The frame the crop is framed on, on the source clock like the trim. Local to this
@@ -745,8 +891,8 @@ export function EditClipModal({
 		setDraftEnd(clip.sourceEndSec ?? clip.sourceStartSec);
 		setActiveEdge(null);
 		setPlayheadSec(clip.sourceStartSec);
-		const region = clip.cropRegion ?? IDENTITY_CROP;
-		const pct = cropDraftToPct(cropDraftFromRegion(region));
+		setDraftRotation(clipRotation(clip));
+		const pct = cropDraftToPct(cropDraftFromRegion(shownCropRegion(clip)));
 		setCropXPct(pct.x);
 		setCropYPct(pct.y);
 		setCropWPct(pct.w);
@@ -791,12 +937,14 @@ export function EditClipModal({
 		// below refills them (immediately, when this clip's metadata is already
 		// loaded).
 		setVideoAspectRatio(16 / 9);
+		setVideoSize(null);
 		const v = cropVideoRef.current;
 		if (!v) return;
 		const onMetadata = () => {
 			v.pause();
 			if (v.videoWidth > 0 && v.videoHeight > 0) {
 				setVideoAspectRatio(v.videoWidth / v.videoHeight);
+				setVideoSize({ width: v.videoWidth, height: v.videoHeight });
 			}
 		};
 		if (v.readyState >= 1) onMetadata();
@@ -826,7 +974,7 @@ export function EditClipModal({
 	const hasTrimChanges =
 		Math.abs(draftStart - clip.sourceStartSec) > 0.001 ||
 		Math.abs(draftEnd - (clip.sourceEndSec ?? 0)) > 0.001;
-	const hasChanges = hasTrimChanges || cropTouched;
+	const hasChanges = hasTrimChanges || cropTouched || draftRotation !== clipRotation(clip);
 	const clipSources = videoSources.filter((s) => s.id === clip.assetId);
 	const cropPreviewSource = clipSources[0] ?? null;
 
@@ -902,6 +1050,15 @@ export function EditClipModal({
 		setCropHPct(fit.h);
 	};
 
+	// Turning the picture keeps the stored crop, so the frame jumps with the picture. That is
+	// not a crop edit: `cropTouched` stays as it was.
+	const handleRotationChange = (next: ClipRotation) => {
+		if (next === draftRotation) return;
+		setDraftRotation(next);
+		setCropXPct(100 - cropXPct - cropWPct);
+		setCropYPct(100 - cropYPct - cropHPct);
+	};
+
 	// Fraction-space width/height ratio the crop is locked to while a preset is
 	// active (null for "Free"). The resize handles honor it, so the user can
 	// move/scale the crop but never change its aspect ratio.
@@ -938,6 +1095,15 @@ export function EditClipModal({
 		setCropYPct(next.y);
 		setCropWPct(next.w);
 		setCropHPct(next.h);
+	};
+
+	// A value typed into one of the pixel fields, once it is committed. A locked ratio holds:
+	// a typed size sets the other side too.
+	const handleCropFieldChange = (field: CropField, px: number) => {
+		if (!isUsableFrameSize(videoSize)) return;
+		const current = { x: cropXPct, y: cropYPct, w: cropWPct, h: cropHPct };
+		setCropTouched(true);
+		setCrop(setCropFieldPx(current, field, px, videoSize, lockedFractionRatio));
 	};
 
 	// The keyboard's way to the same two gestures: the arrows move the crop, Shift + the
@@ -992,8 +1158,9 @@ export function EditClipModal({
 		setDraftStart(clip.sourceStartSec);
 		setDraftEnd(end);
 		setPlayheadSec((p) => Math.min(Math.max(p, clip.sourceStartSec), end));
+		setDraftRotation(clipRotation(clip));
 		const region = clip.cropRegion ?? IDENTITY_CROP;
-		const pct = cropDraftToPct(cropDraftFromRegion(region));
+		const pct = cropDraftToPct(cropDraftFromRegion(shownCropRegion(clip)));
 		setCropXPct(pct.x);
 		setCropYPct(pct.y);
 		setCropWPct(pct.w);
@@ -1002,15 +1169,25 @@ export function EditClipModal({
 		setCropTouched(false);
 	};
 	const handleApply = () => {
-		const nextCrop: CropRegion = {
-			x: Math.max(0, Math.min(1, cropXPct / 100)),
-			y: Math.max(0, Math.min(1, cropYPct / 100)),
-			width: Math.max(0.01, Math.min(1, cropWPct / 100)),
-			height: Math.max(0.01, Math.min(1, cropHPct / 100)),
+		const width = Math.max(0.01, Math.min(1, cropWPct / 100));
+		const height = Math.max(0.01, Math.min(1, cropHPct / 100));
+		// Kept inside the frame, so turning it never yields a negative x/y.
+		const shownCrop: CropRegion = {
+			x: Math.max(0, Math.min(1 - width, cropXPct / 100)),
+			y: Math.max(0, Math.min(1 - height, cropYPct / 100)),
+			width,
+			height,
 		};
+		// Stored in source coordinates, whatever the dialog showed it on.
+		const nextCrop = draftRotation === 180 ? turnCropRegion(shownCrop) : shownCrop;
 		const isIdentity =
 			nextCrop.x === 0 && nextCrop.y === 0 && nextCrop.width === 1 && nextCrop.height === 1;
-		onApply(draftStart, draftEnd, cropTouched ? (isIdentity ? null : nextCrop) : undefined);
+		onApply(
+			draftStart,
+			draftEnd,
+			cropTouched ? (isIdentity ? null : nextCrop) : undefined,
+			draftRotation !== clipRotation(clip) ? draftRotation : undefined,
+		);
 		onClose();
 	};
 
@@ -1075,6 +1252,7 @@ export function EditClipModal({
 							height: "100%",
 							objectFit: "contain",
 							background: "#000",
+							transform: draftRotation === 180 ? "rotate(180deg)" : undefined,
 						}}
 					/>
 				) : null}
@@ -1236,9 +1414,102 @@ export function EditClipModal({
 							onChange={handleCropRatioChange}
 						/>
 					</div>
+					<span className={styles.fieldLabel}>{t("editClipDialog.rotation")}</span>
+					<div style={{ flexShrink: 0 }}>
+						<ChoiceRow<ClipRotation>
+							label={t("editClipDialog.rotation")}
+							options={[
+								// The tip explains the turn, so 0° carries none: its label says all of it.
+								{ value: 0, label: t("editClipDialog.rotationUpright") },
+								{
+									value: 180,
+									label: t("editClipDialog.rotationTurned"),
+									title: t("editClipDialog.rotationTip"),
+								},
+							]}
+							value={draftRotation}
+							onChange={handleRotationChange}
+						/>
+					</div>
+				</div>
+				<div
+					role="group"
+					aria-label={ts("crop.position")}
+					style={{ display: "flex", gap: 10, marginTop: 8 }}
+				>
+					{(
+						[
+							["x", ts("crop.x")],
+							["y", ts("crop.y")],
+							["w", ts("crop.width")],
+							["h", ts("crop.height")],
+						] as const
+					).map(([field, label]) => {
+						const crop = { x: cropXPct, y: cropYPct, w: cropWPct, h: cropHPct };
+						const usable = isUsableFrameSize(videoSize);
+						return (
+							<CropPxField
+								key={field}
+								label={label}
+								value={usable ? cropPctToPx(crop, videoSize)[field] : null}
+								range={
+									usable ? cropFieldRangePx(crop, field, videoSize, lockedFractionRatio) : null
+								}
+								onChange={(px) => handleCropFieldChange(field, px)}
+							/>
+						);
+					})}
 				</div>
 			</div>
 		</ModalShell>
+	);
+}
+
+/** One of the crop's pixel fields. It keeps what is being typed until it loses focus, so a
+ *  field can be cleared and retyped; every valid number is applied to the crop as it is typed,
+ *  and the field shows the clamped value again on blur. */
+function CropPxField({
+	label,
+	value,
+	range,
+	onChange,
+}: {
+	label: string;
+	value: number | null;
+	range: { min: number; max: number } | null;
+	onChange: (px: number) => void;
+}) {
+	const id = useId();
+	const [draft, setDraft] = useState<string | null>(null);
+	const commit = () => {
+		if (draft !== null && draft.trim() !== "") onChange(Number(draft));
+		setDraft(null);
+	};
+	return (
+		<div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }}>
+			<label htmlFor={id} className={styles.fieldLabel} style={{ flexShrink: 0 }}>
+				{label}
+			</label>
+			<input
+				id={id}
+				className={styles.control}
+				type="number"
+				inputMode="numeric"
+				step={1}
+				min={range?.min}
+				max={range?.max}
+				disabled={value === null}
+				value={value === null ? "" : (draft ?? String(value))}
+				// What is typed applies on blur or Enter: applied per keystroke, the "1" of "1080"
+				// would snap the crop to its minimum size first.
+				onChange={(e) => setDraft(e.target.value)}
+				onBlur={commit}
+				onKeyDown={(e) => {
+					if (e.key === "Enter" && !e.nativeEvent.isComposing) commit();
+				}}
+				style={{ flex: 1, minWidth: 0, fontVariantNumeric: "tabular-nums" }}
+			/>
+		</div>
 	);
 }
 

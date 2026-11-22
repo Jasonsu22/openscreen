@@ -5,12 +5,14 @@
 // PostHog builds no person from it. Weekly and monthly actives are counted the way Brave
 // counts them, without an ID: the app remembers locally when it last pinged and says
 // whether this is its first ping of the week and of the month, so WAU and MAU are plain
-// counts of those flags. GeoIP is off on every event, and the PostHog project discards IP
-// addresses. The website FAQ ("Does OpenScreen work offline?") lists this payload; keep it
-// in step.
+// counts of those flags. To measure retention without an ID either, each ping also carries
+// the ISO week the app was installed: a cohort shared by every install of that week, never
+// finer than a week, and not an identifier. GeoIP is off on every event, and the PostHog
+// project discards IP addresses. The website FAQ ("Does OpenScreen work offline?") and the
+// privacy policy list this payload; keep them in step.
 
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { InstallChannel } from "./install-channel";
 
@@ -27,6 +29,8 @@ export interface UsagePingState {
 	day: string | null;
 	week: string | null;
 	month: string | null;
+	/** ISO week of the installation, or "unknown" when it could not be dated. */
+	installWeek: string | null;
 }
 
 export interface UsagePingFacts {
@@ -39,7 +43,13 @@ export interface UsagePingFacts {
 	surface: "app" | "mcp";
 }
 
-const DEFAULT_STATE: UsagePingState = { enabled: true, day: null, week: null, month: null };
+const DEFAULT_STATE: UsagePingState = {
+	enabled: true,
+	day: null,
+	week: null,
+	month: null,
+	installWeek: null,
+};
 
 /** An environment flag counts as set unless it is empty, "0" or "false": `CI=false` is off. */
 const isSet = (value: string | undefined) =>
@@ -63,6 +73,31 @@ export function periodKeys(now: Date): { day: string; week: string; month: strin
 		week: `${year}-W${String(week).padStart(2, "0")}`,
 		month: iso.slice(0, 7),
 	};
+}
+
+/** "2026-W44" (weeks 01 to 53) or "unknown"; anything else is re-derived. */
+const INSTALL_WEEK = /^(\d{4}-W(0[1-9]|[1-4]\d|5[0-3])|unknown)$/;
+
+/** The install week, dated by when the userData directory was created. Electron creates it
+ *  on first launch, so a fresh install gets the current week, and an install older than
+ *  this field, even one that never pinged, gets its real one. Where the filesystem records
+ *  no birthtime (0), the week is "unknown": mtime moves whenever the folder changes, and the
+ *  week is kept for good once sent. */
+export function installWeekFrom(stats: { birthtimeMs: number } | null): string {
+	const date = new Date(stats?.birthtimeMs ?? 0);
+	// Beyond ±8.64e15 ms a Date is invalid, and toISOString would throw outside any try.
+	if (!(date.getTime() > 0)) return "unknown";
+	// A week the loader would reject (year 10000 and on) would be re-derived on every ping.
+	const { week } = periodKeys(date);
+	return INSTALL_WEEK.test(week) ? week : "unknown";
+}
+
+function statOrNull(dir: string) {
+	try {
+		return statSync(dir);
+	} catch {
+		return null;
+	}
 }
 
 /** The ping to send now, or null. Pure, so the whole matrix pins from any platform. */
@@ -95,6 +130,10 @@ export function loadUsagePingState(userData: string): UsagePingState {
 			day: text(raw.day),
 			week: text(raw.week),
 			month: text(raw.month),
+			installWeek:
+				typeof raw.installWeek === "string" && INSTALL_WEEK.test(raw.installWeek)
+					? raw.installWeek
+					: null,
 		};
 	} catch {
 		return { ...DEFAULT_STATE };
@@ -127,6 +166,8 @@ export async function sendUsagePing(
 	const state = loadUsagePingState(userData);
 	const plan = planUsagePing(state, facts.channel, env, now);
 	if (!plan) return;
+	// Kept once known, "unknown" included, so an install never changes cohort.
+	const installWeek = state.installWeek ?? installWeekFrom(statOrNull(userData));
 	try {
 		const response = await fetchImpl(CAPTURE_URL, {
 			method: "POST",
@@ -145,13 +186,18 @@ export async function sendUsagePing(
 					surface: facts.surface,
 					first_this_week: plan.firstThisWeek,
 					first_this_month: plan.firstThisMonth,
+					install_week: installWeek,
 				},
 			}),
 			signal: AbortSignal.timeout(15_000),
 		});
 		// Re-read rather than reuse `state`: the tray checkbox may have changed while this ran.
 		if (response.ok)
-			saveUsagePingState(userData, { ...loadUsagePingState(userData), ...plan.keys });
+			saveUsagePingState(userData, {
+				...loadUsagePingState(userData),
+				...plan.keys,
+				installWeek,
+			});
 	} catch {
 		// Offline, blocked or timed out: the next attempt tries again.
 	}

@@ -236,7 +236,16 @@ encoder (software VP9 was measured too slow and removed — see
 [native-compositor.md](native-compositor.md#known-gaps)). GIF goes through
 the same addon (`exportGif`, `gif_export.rs`): a median-cut palette per frame,
 mapped with Floyd-Steinberg dithering by default so a gradient wallpaper does
-not break into flat bands.
+not break into flat bands. After the first frame, a frame redraws only the
+rectangle around what changed, with the pixels in it that did not change left
+transparent (the palette's last entry, kept for that). With the dither on, it
+redraws whole 8×8 tiles around what changed, so the error diffusion only runs
+across pixels drawn together. A frame that changed
+nothing is not written: it lengthens the previous frame's delay. So a still
+stretch costs nothing, and dither noise stays inside the area that moved. The
+palette is rebuilt every 30 frames, and at once when most of the picture moves
+(a cut, a zoom), so a new picture is never mapped to the old one's colours; a
+palette that changed redraws the whole frame.
 
 ## Licensing
 

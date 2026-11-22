@@ -171,6 +171,9 @@ function createShimElectronAPI() {
 		showAbout: () => Promise.resolve(),
 		// No installer in browser mode, so nothing may ever be checked.
 		canCheckForUpdatesNow: () => Promise.resolve(false),
+		getUpdateBadge: () => Promise.resolve(null),
+		onUpdateBadgeChanged: () => () => undefined,
+		applyUpdate: () => Promise.resolve(),
 		getSources: () => Promise.resolve(SHIM_SOURCES),
 		selectSource: (source: ShimDesktopSource, options?: { persist?: boolean }) => {
 			shimSelectedSource = source;
@@ -184,6 +187,7 @@ function createShimElectronAPI() {
 			return () => shimSelectedSourceListeners.delete(callback);
 		},
 		getRecordingPrefs: () => Promise.resolve(shimRecordingPrefs),
+		setRecordingState: () => Promise.resolve({ success: true as const }),
 		setRecordingPrefs: (patch: Partial<ShimRecordingPrefs>) => {
 			const next = { ...shimRecordingPrefs, ...patch };
 			try {
@@ -545,6 +549,8 @@ function createShimBridgeClient() {
 				saveProjectsState();
 				return Promise.resolve({ success: true });
 			},
+			recordings: (_projectId: string) =>
+				Promise.resolve({ success: true, count: 0, sizeBytes: 0, keptFor: [], unreadable: 0 }),
 			addAsset: (projectId: string, path: string, label?: string, kind?: "video" | "audio") => {
 				const doc = documentsByProject[projectId];
 				if (!doc) return Promise.resolve({ assetId: "", document: null });

@@ -34,9 +34,9 @@ OpenScreen est un enregistreur d'écran et éditeur vidéo gratuit, sous licence
 
 - **huggingface.co, une fois.** La première transcription télécharge le modèle Whisper, environ 264 Mo, et un modèle de détection de la voix de moins de 1 Mo, chacun vérifié à l'aide d'une empreinte SHA-256. Ensuite, la transcription n'a plus besoin de connexion.
 - **github.com, une fois par langue.** Sur une machine dotée d'un GPU, la première transcription en anglais ou en français télécharge aussi le modèle qui recale chaque mot dans le temps : environ 110 Mo pour l'anglais, 350 Mo pour le français.
-- **github.com et api.github.com.** Les versions qui se mettent à jour d'elles-mêmes vérifient la présence d'une nouvelle version toutes les 24 heures, et quand vous le demandez. Par défaut, elles se contentent de vous signaler qu'une version est disponible.
+- **github.com et api.github.com.** Les versions qui se mettent à jour d'elles-mêmes vérifient la présence d'une nouvelle version une minute après le lancement, puis toutes les six heures, et quand vous le demandez. Elles la téléchargent en arrière-plan et affichent un bouton de mise à jour ; rien n'est installé tant que vous n'avez pas cliqué dessus.
 - **fonts.googleapis.com, seulement pour une police ajoutée en 1.x.** Une police d'annotation personnalisée ajoutée dans une version précédente est encore téléchargée au lancement, bien que la 2.x ne l'affiche plus.
-- **PostHog, une fois par jour.** Un comptage anonyme des installations actives, envoyé aux serveurs de PostHog dans l'UE. Il contient la version de l'application, le système d'exploitation, l'architecture du processeur, le mode d'installation de l'application, si elle a servi directement ou à un agent IA via son serveur MCP, et s'il s'agit du premier comptage de la semaine et du mois. C'est tout : aucun identifiant d'installation (chaque comptage reçoit un nouvel identifiant aléatoire), aucune adresse IP conservée, rien sur vos enregistrements. Décochez **Envoyer le comptage d'utilisation anonyme** dans le menu de l'icône de la zone de notification pour le désactiver, ou définissez `DO_NOT_TRACK=1`.
+- **PostHog, une fois par jour.** Un comptage anonyme des installations actives, envoyé aux serveurs de PostHog dans l'UE. Il contient la version de l'application, le système d'exploitation, l'architecture du processeur, le mode d'installation de l'application, si elle a servi directement ou à un agent IA via son serveur MCP, s'il s'agit du premier comptage de la semaine et du mois, et la semaine d'installation de l'application. C'est tout : aucun identifiant d'installation (chaque comptage reçoit un nouvel identifiant aléatoire), aucune adresse IP conservée, rien sur vos enregistrements. Décochez **Envoyer le comptage d'utilisation anonyme** dans le menu de l'icône de la zone de notification pour le désactiver, ou définissez `DO_NOT_TRACK=1`.
 - **Votre fournisseur d'IA, seulement si vous en connectez un.** Le montage par chat envoie vos messages et les données du projet qu'il lit, comme la timeline et la transcription. La traduction des sous-titres envoie le texte des sous-titres. Les deux restent désactivés tant que vous n'avez pas connecté de fournisseur. Voir [Montage par IA](./ai-editing.md).
 
 ## OpenScreen collecte-t-il des statistiques d'usage ou des rapports de plantage ? {#does-openscreen-collect-analytics-or-crash-reports}
@@ -44,7 +44,7 @@ OpenScreen est un enregistreur d'écran et éditeur vidéo gratuit, sous licence
 **Un comptage quotidien anonyme, rien d'autre.** L'application ne contient aucun SDK de statistiques d'usage ni de rapport de plantage, et rien n'enregistre ce que vous y faites.
 
 - Une fois par jour, l'application signale qu'une installation a été active. [OpenScreen fonctionne-t-il hors ligne ?](#does-openscreen-work-offline) détaille exactement ce que contient ce comptage et comment le désactiver.
-- Le comptage ne porte aucun identifiant d'installation : chacun reçoit un nouvel identifiant aléatoire, et rien d'autre n'y est propre à votre ordinateur.
+- Le comptage ne porte aucun identifiant d'installation : chacun reçoit un nouvel identifiant aléatoire, et rien d'autre n'y est propre à votre ordinateur. La semaine d'installation qu'il porte, par exemple `2026-W44`, est la semaine où l'application a été installée, la même pour tous ceux qui l'ont installée cette semaine-là, et non un identifiant.
 - Les clés des fournisseurs d'IA sont stockées chiffrées avec `safeStorage` d'Electron. Si le chiffrement n'est pas disponible, la clé n'est pas enregistrée.
 
 ## Peut-on installer OpenScreen en toute sécurité ? {#is-openscreen-safe-to-install}
@@ -79,7 +79,7 @@ La page [Installation](./installation.md) donne les étapes pour chaque platefor
 ## Peut-on installer OpenScreen avec winget, Homebrew ou Flathub ? {#can-i-install-openscreen-with-winget-homebrew-or-flathub}
 
 - **winget :** oui, via la source du Store : `winget install --source msstore OpenScreen`.
-- **Homebrew :** oui, via le tap officiel : `brew install --cask getopenscreen/openscreen/openscreen`. Chaque version stable met le cask à jour.
+- **Homebrew :** oui : `brew install --cask openscreen`, depuis la liste principale de Homebrew, ou via le tap officiel : `brew install --cask getopenscreen/openscreen/openscreen`. Les deux suivent chaque version stable. L'ancien tap `siddharthvaddem/openscreen` s'arrête à la v1.5.0.
 - **Flathub :** il n'y a pas de fiche.
 
 ## S'agit-il du projet OpenScreen d'origine ? {#is-this-the-original-openscreen-project}
@@ -88,7 +88,7 @@ La page [Installation](./installation.md) donne les étapes pour chaque platefor
 
 - Siddharth Vaddem a créé OpenScreen et archivé le [dépôt d'origine](https://github.com/siddharthvaddem/openscreen) après la v1.5.0.
 - Le développement a migré vers [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen) avec son accord, sous le même nom et la même licence MIT.
-- Le README archivé présente ce projet comme un projet dérivé porté par la communauté et mené par l'un des principaux contributeurs. Il s'agit d'Etienne Lescot, qui le maintient. Le lien du README, github.com/EtienneLescot/openscreen, redirige vers le dépôt actuel.
+- Le README archivé renvoie désormais vers ce dépôt. Etienne Lescot, l'un des principaux contributeurs du projet d'origine, le maintient.
 - Le dépôt archivé ne reçoit plus de mises à jour. [Picking up OpenScreen (en anglais)](/blog/2026/06/15/picking-up-openscreen/) raconte la passation.
 
 ## OpenScreen a-t-il un lien avec openscreen.io ou openscreen.net ? {#is-openscreen-related-to-openscreenio-or-openscreennet}

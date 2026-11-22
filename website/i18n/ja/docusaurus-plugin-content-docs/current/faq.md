@@ -34,9 +34,9 @@ OpenScreen は、Windows、macOS、Linux に対応した、MIT ライセンス�
 
 - **huggingface.co（一度だけ）。** 最初の文字起こしで約 264 MB の Whisper モデルと、1 MB 未満の音声検出モデルをダウンロードし、それぞれ SHA-256 ハッシュで検証します。それ以降、文字起こしに接続は必要ありません。
 - **github.com（言語ごとに一度だけ）。** GPU を搭載したマシンでは、英語またはフランス語の最初の文字起こしで、各単語のタイミングを付け直すモデルもダウンロードします。英語は約 110 MB、フランス語は約 350 MB です。
-- **github.com と api.github.com。** 自動でアップデートするビルドは、24 時間ごとと、ユーザーが求めたときに、新しいリリースを確認します。既定では、新しいリリースがあることを知らせるだけです。
+- **github.com と api.github.com。** 自動でアップデートするビルドは、起動の 1 分後、その後は 6 時間ごと、そしてユーザーが求めたときに、新しいリリースを確認します。バックグラウンドでダウンロードしてアップデートボタンを表示し、ボタンをクリックするまでは何もインストールしません。
 - **fonts.googleapis.com（1.x で追加したフォントのみ）。** 以前のバージョンで追加したカスタムの注釈フォントは、2.x では描画されませんが、起動時に引き続き読み込まれます。
-- **PostHog（1 日 1 回）。** アクティブなインストール数の匿名カウントで、PostHog の EU サーバーに送信されます。内容は、アプリのバージョン、OS、プロセッサのアーキテクチャ、アプリのインストール方法、アプリが直接使われたか AI エージェントが MCP サーバー経由で使ったか、そしてその週とその月で最初のカウントかどうかです。それ以外は何もありません。インストールを識別する ID はなく（カウントごとに新しいランダム ID が付きます）、IP アドレスは保持されず、録画に関する情報も一切含みません。無効にするには、トレイメニューの**匿名の利用カウントを送信**のチェックを外すか、`DO_NOT_TRACK=1` を設定します。
+- **PostHog（1 日 1 回）。** アクティブなインストール数の匿名カウントで、PostHog の EU サーバーに送信されます。内容は、アプリのバージョン、OS、プロセッサのアーキテクチャ、アプリのインストール方法、アプリが直接使われたか AI エージェントが MCP サーバー経由で使ったか、その週とその月で最初のカウントかどうか、そしてアプリをインストールした週です。それ以外は何もありません。インストールを識別する ID はなく（カウントごとに新しいランダム ID が付きます）、IP アドレスは保持されず、録画に関する情報も一切含みません。無効にするには、トレイメニューの**匿名の利用カウントを送信**のチェックを外すか、`DO_NOT_TRACK=1` を設定します。
 - **AI プロバイダー（接続した場合のみ）。** チャット編集では、あなたのメッセージと、エージェントが読み取るプロジェクトのデータ（タイムラインや文字起こしなど）が送信されます。字幕の翻訳では、字幕のテキストが送信されます。どちらも、プロバイダーを接続するまではオフです。[AI 編集](./ai-editing.md)を参照してください。
 
 ## OpenScreen は利用状況の分析データやクラッシュレポートを収集しますか？ {#does-openscreen-collect-analytics-or-crash-reports}
@@ -44,7 +44,7 @@ OpenScreen は、Windows、macOS、Linux に対応した、MIT ライセンス�
 **1 日 1 回の匿名カウントだけで、ほかには何もありません。** アプリには、利用状況の分析やクラッシュレポートのための SDK は含まれておらず、アプリ内での操作を記録するものもありません。
 
 - 1 日 1 回、アプリはインストールが 1 つアクティブだったことを報告します。このカウントの内容と無効にする方法は、[OpenScreen はオフラインで使えますか？](#does-openscreen-work-offline)に正確に記載しています。
-- カウントにはインストールを識別する ID がありません。カウントごとに新しいランダム ID が付き、それ以外にパソコン固有の情報は含まれません。
+- カウントにはインストールを識別する ID がありません。カウントごとに新しいランダム ID が付き、それ以外にパソコン固有の情報は含まれません。含まれるインストール週（`2026-W44` など）は、インストールした週そのものです。その週にインストールした全員で同じ値になり、識別子ではありません。
 - AI プロバイダーのキーは、Electron の `safeStorage` で暗号化して保存されます。暗号化が利用できない場合、キーは保存されません。
 
 ## OpenScreen は安全にインストールできますか？ {#is-openscreen-safe-to-install}
@@ -79,7 +79,7 @@ OpenScreen は、Windows、macOS、Linux に対応した、MIT ライセンス�
 ## winget、Homebrew、Flathub で OpenScreen をインストールできますか？ {#can-i-install-openscreen-with-winget-homebrew-or-flathub}
 
 - **winget：** はい。Store のソース経由でインストールできます（`winget install --source msstore OpenScreen`）。
-- **Homebrew：** はい。公式の tap からインストールできます（`brew install --cask getopenscreen/openscreen/openscreen`）。安定版のリリースごとに cask が更新されます。
+- **Homebrew：** はい。Homebrew 本体の cask 一覧から `brew install --cask openscreen`、または公式の tap から `brew install --cask getopenscreen/openscreen/openscreen` でインストールできます。どちらも安定版のリリースごとに更新されます。旧 tap の `siddharthvaddem/openscreen` は v1.5.0 で止まっています。
 - **Flathub：** 掲載されていません。
 
 ## これは元の OpenScreen プロジェクトですか？ {#is-this-the-original-openscreen-project}
@@ -88,7 +88,7 @@ OpenScreen は、Windows、macOS、Linux に対応した、MIT ライセンス�
 
 - Siddharth Vaddem が OpenScreen を開発し、v1.5.0 のあとに[元のリポジトリ](https://github.com/siddharthvaddem/openscreen)をアーカイブしました。
 - 開発は彼の了承のもと、同じ名前、同じ MIT ライセンスで [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen) に移りました。
-- アーカイブされた README では、このプロジェクトはコアコントリビューターの 1 人が率いる、コミュニティ主導のスピンオフとされています。その人物が、メンテナーの Etienne Lescot です。README 内のリンク github.com/EtienneLescot/openscreen は、現在のリポジトリにリダイレクトされます。
+- アーカイブされた README は、現在このリポジトリを案内しています。メンテナーは、元のプロジェクトのコアコントリビューターの 1 人である Etienne Lescot です。
 - アーカイブされたリポジトリは更新されません。引き継ぎの経緯は [Picking up OpenScreen（英語）](/blog/2026/06/15/picking-up-openscreen/)で説明しています。
 
 ## OpenScreen は openscreen.io や openscreen.net と関係がありますか？ {#is-openscreen-related-to-openscreenio-or-openscreennet}

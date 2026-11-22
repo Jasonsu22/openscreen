@@ -351,7 +351,12 @@
 		"done": "Terminer",
 		"ratio": "Ratio",
 		"cropVideo": "Recadrer la vidéo",
-		"lockAspectRatio": "Verrouiller le ratio"
+		"lockAspectRatio": "Verrouiller le ratio",
+		"x": "X (px)",
+		"y": "Y (px)",
+		"width": "Largeur (px)",
+		"height": "Hauteur (px)",
+		"position": "Position et taille du recadrage en pixels"
 	},
 	"zoom": {
 		"position": {
@@ -388,6 +393,7 @@
 	},
 	"audio": {
 		"outputGain": "Niveau de sortie",
+		"muteRecording": "Couper le son de l'enregistrement",
 		"help": "Les voix sont automatiquement ramenées à une sonie standard. Ajustez le niveau de sortie à partir de là ; il s’applique à l’identique dans l’aperçu et à l’export.",
 		"reset": "Réinitialiser l’audio",
 		"title": "Audio"

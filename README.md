@@ -53,7 +53,7 @@ A raw capture goes in and comes out ready to post — on X, Reddit, YouTube, a d
 - Timeline snapping guides and an audio waveform to make trimming easier.
 - Customizable keyboard shortcuts.
 - Export to MP4 or GIF in multiple aspect ratios and resolutions, rendered and encoded on the GPU (Metal on macOS, D3D11 on Windows, Vulkan on Linux) with an automatic CPU fallback.
-- Languages supported: Arabic, Czech, English, Spanish, French, German, Italian, Japanese, Korean, Portuguese (Brazil), Russian, Turkish, Vietnamese, Simplified Chinese, and Traditional Chinese.
+- Languages supported: Arabic, Czech, English, Spanish, French, German, Italian, Japanese, Korean, Dutch, Polish, Portuguese (Brazil), Russian, Turkish, Vietnamese, Simplified Chinese, and Traditional Chinese.
 
 ## Command-line interface (headless)
 
@@ -103,14 +103,20 @@ Every platform has a recommended route below. On Windows that is the Microsoft S
 
 - **Windows**: version 1903+ (build 18362) with Intel 8th Gen / AMD Ryzen 2000 series or newer minimum; Windows 11 with Intel 12th Gen / Ryzen 4000 series or newer recommended
 - **macOS**: 13 (Ventura) or later — required by ScreenCaptureKit for capture
-- **Linux**: `xdg-desktop-portal` and PipeWire for native capture and system audio; recording still works without them through the browser-capture fallback, with fewer capabilities (see [Platform differences](#platform-differences))
+- **Linux**: native X11 capture needs no ScreenCast portal; Wayland capture needs `xdg-desktop-portal` and PipeWire, and system audio needs PipeWire; recording still works without them through the browser-capture fallback, with fewer capabilities (see [Platform differences](#platform-differences))
 - **RAM**: 8 GB minimum, 16 GB recommended
 
 Full table and notes on older integrated graphics: [system requirements](https://getopenscreen.com/docs/installation#system-requirements).
 
 ### macOS
 
-Download the `.dmg` installer directly from the [Releases page](https://github.com/getopenscreen/openscreen/releases) and drag OpenScreen into your Applications folder. Builds from 1.9.0 onward are signed with a Developer ID certificate and notarized by Apple, so Gatekeeper does not block them and no terminal step is needed.
+Install with [Homebrew](https://formulae.brew.sh/cask/openscreen):
+
+```bash
+brew install --cask openscreen
+```
+
+Or download the `.dmg` installer directly from the [Releases page](https://github.com/getopenscreen/openscreen/releases) and drag OpenScreen into your Applications folder. Builds from 1.9.0 onward are signed with a Developer ID certificate and notarized by Apple, so Gatekeeper does not block them and no terminal step is needed.
 
 On first launch, open **System Settings > Privacy & Security** and grant the two permissions OpenScreen needs: **Screen Recording** and **Accessibility**. Recording cannot start until both are granted.
 
@@ -213,8 +219,8 @@ You may need to grant screen recording permissions depending on your desktop env
 
 Everything in the editor and export is the same on macOS, Windows, and Linux: zooms, backgrounds, motion blur, crop/trim/speed, blur regions, annotations, auto-captions, AI editing, projects, export, and all languages. All three now record through a native capture pipeline; the remaining differences are narrower than they used to be:
 
-- **Native recording**: macOS (ScreenCaptureKit), Windows (Windows Graphics Capture), and Linux (PipeWire via the ScreenCast portal) all record through a native pipeline for higher quality and clean window-level capture. On Linux the browser pipeline stays as an automatic fallback if the helper isn't available.
-- **Custom cursors**: on macOS and Windows the real cursor is captured with shape, type, and clicks. Linux captures position and cursor shape through the portal, so the editable cursor overlay works there too. Click effects work on Linux as well, but not through the portal — Wayland exposes no portal for mouse buttons, so the capture helper reads the left button from evdev, which needs read access to your mouse: a udev rule for pointer devices (recommended) or the `input` group, set up as [Mouse clicks on Wayland](https://getopenscreen.com/docs/installation#mouse-clicks-on-wayland) shows. Without that, recording is unaffected and every cursor sample is simply a move.
+- **Native recording**: macOS (ScreenCaptureKit), Windows (Windows Graphics Capture), and Linux (PipeWire via the ScreenCast portal, or direct X11 capture on an X11 desktop without one) all record through a native pipeline for higher quality and clean window-level capture. On Linux the browser pipeline stays as an automatic fallback if the helper isn't available.
+- **Custom cursors**: on macOS and Windows the real cursor is captured with shape, type, and clicks. On X11, the helper captures cursor shape through XFixes and mouse buttons through XInput2, without access to `/dev/input`. On Wayland, Linux captures position and cursor shape through the portal, so the editable cursor overlay works there too. Click effects work on Wayland as well, but not through the portal — Wayland exposes no portal for mouse buttons, so the capture helper reads the left button from evdev, which needs read access to your mouse: a udev rule for pointer devices (recommended) or the `input` group, set up as [Mouse clicks on Wayland](https://getopenscreen.com/docs/installation#mouse-clicks-on-wayland) shows. Without that, recording is unaffected and every cursor sample is simply a move.
 - **Webcam**: every platform saves the webcam as a separate file next to the screen recording. Windows captures it natively in the recording helper; macOS and Linux record it in the app. It works as a picture-in-picture overlay on all three.
 - **System audio** support varies by OS:
   - **macOS**: works on every supported version. On macOS 14.2+ you'll be prompted to grant audio capture permission.
@@ -227,11 +233,13 @@ This repository is the community-maintained continuation of OpenScreen.
 
 Official / trusted links:
 
-* Original archived repository: https://github.com/siddharthvaddem/openscreen
 * Community continuation: https://github.com/getopenscreen/openscreen
 * Official website: https://getopenscreen.com
+* Microsoft Store: https://apps.microsoft.com/detail/9MXQ1HQJL5G5
+* Homebrew: `brew install --cask openscreen`
+* Original archived repository: https://github.com/siddharthvaddem/openscreen (stops at v1.5.0, like its `siddharthvaddem/openscreen` Homebrew tap)
 
-For safety, download OpenScreen only from the official GitHub Releases linked from this repository. Third-party websites using the OpenScreen name are not affiliated with this continuation unless explicitly listed here.
+For safety, install OpenScreen only from the official GitHub Releases linked from this repository, the Microsoft Store listing above, or the official Homebrew cask. Forks on GitHub and third-party websites using the OpenScreen name are not affiliated with this continuation unless explicitly listed here. There is no `getopenscreen/tap` Homebrew tap.
 
 ## Community
 

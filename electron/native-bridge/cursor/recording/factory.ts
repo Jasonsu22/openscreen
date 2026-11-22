@@ -1,9 +1,12 @@
 import type { Rectangle } from "electron";
+import { isWaylandSession } from "../../../wayland";
 import { MacNativeCursorRecordingSession } from "./macNativeCursorRecordingSession";
 import { PipeWireCursorRecordingSession } from "./pipeWireCursorRecordingSession";
 import type { CursorRecordingSession } from "./session";
 import { TelemetryRecordingSession } from "./telemetryRecordingSession";
 import { WindowsNativeRecordingSession } from "./windowsNativeRecordingSession";
+import { isX11PointerFallbackEnabled } from "./x11PointerFallback";
+import { X11PointerRecordingSession } from "./x11PointerRecordingSession";
 
 interface CreateCursorRecordingSessionOptions {
 	getDisplayBounds: () => Rectangle | null;
@@ -12,6 +15,17 @@ interface CreateCursorRecordingSessionOptions {
 	sampleIntervalMs: number;
 	sourceId?: string | null;
 	startTimeMs?: number;
+}
+
+export function createX11PointerRecordingSession(
+	options: Omit<CreateCursorRecordingSessionOptions, "platform" | "sourceId">,
+): CursorRecordingSession {
+	return new X11PointerRecordingSession({
+		getDisplayBounds: options.getDisplayBounds,
+		maxSamples: options.maxSamples,
+		sampleIntervalMs: options.sampleIntervalMs,
+		startTimeMs: options.startTimeMs,
+	});
 }
 
 export function createCursorRecordingSession(
@@ -36,7 +50,7 @@ export function createCursorRecordingSession(
 		});
 	}
 
-	if (options.platform === "linux") {
+	if (options.platform === "linux" && isWaylandSession(process.env)) {
 		// The ScreenCast portal's METADATA cursor mode is the only source of a real
 		// pointer position on Wayland: `screen.getCursorScreenPoint()` returns
 		// {0,0} there, so TelemetryRecordingSession produced well-formed recordings
@@ -50,7 +64,7 @@ export function createCursorRecordingSession(
 		});
 	}
 
-	// Anything else (a future platform, or a test harness): capture cursor
+	// Anything else (X11, a future platform, or a test harness): capture cursor
 	// positions via Electron's `screen` API on an interval. No cursor
 	// sprites/assets and no clicks, just position telemetry.
 	return new TelemetryRecordingSession({
@@ -60,3 +74,5 @@ export function createCursorRecordingSession(
 		startTimeMs: options.startTimeMs,
 	});
 }
+
+export { isX11PointerFallbackEnabled };

@@ -5,19 +5,21 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
-import { app, BrowserWindow, ipcMain, Menu, session, systemPreferences } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, net, session, systemPreferences } from "electron";
 import type { CliProgressEvent, CliSourcesResult } from "../../src/lib/cliContracts";
 import { renameWithRetry } from "../atomic-rename";
-import { isDiagnosticModeEnabled } from "../diagnostics/main-log-buffer";
-import { getInstallChannel } from "../install-channel";
+import { isDiagnosticModeEnabled } from "../diagnostics/main-log-file";
+import { getInstallChannel, ownsItsUpdates } from "../install-channel";
 import { getSelectedDesktopSource, registerIpcHandlers } from "../ipc/handlers";
 import { openVideoInHiddenWindow } from "../mcp/hidden-video";
+import { watchForMacMcpShutdown } from "../mcp/mac-update-shutdown";
 import { serveMcpOverStdio } from "../mcp/stdio-server";
+import { readReleaseLookup, refreshReleaseLookup, updateNotice } from "../mcp/update-notice";
 import { registerSttIpc, shutdownStt } from "../stt";
 import { sendUsagePing, USAGE_PING_INTERVAL_MS } from "../usage-ping";
 import { createRunnerWindow } from "../windows";
 import { CLI_USAGE, type CliCommand } from "./args";
-import { openGuiFromCli } from "./openGui";
+import { onCliActivate } from "./openGui";
 import { runInfoCommand, runPackCommand } from "./projectCommands";
 import { createRunnerHost } from "./runnerHost";
 import { isolateCliSessionData } from "./sessionData";
@@ -281,7 +283,7 @@ export function runCli(command: CliCommand): void {
 	// to this process on to the GUI (see openGui.ts).
 	if (process.platform === "darwin") {
 		app.dock?.hide();
-		app.on("activate", () => openGuiFromCli(process.execPath, Date.now(), () => app.dock?.hide()));
+		app.on("activate", () => onCliActivate(app.dock));
 		// No application menu either. That menu shows whenever this hidden process comes to the
 		// front, as it does while it hands a launch on to the GUI, and its Quit (Cmd+Q) would end
 		// the agent's MCP server rather than anything the user knowingly started. On macOS
@@ -402,15 +404,55 @@ export function runCli(command: CliCommand): void {
 			});
 
 			if (command.kind === "mcp") {
-				await serveMcpOverStdio({
+				// Only where the app updates itself: elsewhere a package manager already does, and
+				// opening the app would not change that.
+				const tellsAboutUpdates = app.isPackaged && ownsItsUpdates(getInstallChannel());
+				let closing = false;
+				let stopWatchingUpdate: (() => void) | undefined;
+				const closeMcp = () => {
+					if (closing) return;
+					closing = true;
+					stopWatchingUpdate?.();
+					// The Whisper helper must not outlive the server.
+					void shutdownStt().finally(() => app.exit(0));
+				};
+				const mcp = await serveMcpOverStdio({
 					...agentServices,
 					userDataDir,
 					runners,
 					openVideo: openVideoInHiddenWindow,
-					// The Whisper helper is a process of its own: it must not outlive this one.
-					onClose: () => void shutdownStt().finally(() => app.exit(0)),
+					updateNotice: tellsAboutUpdates
+						? (updateNotice(app.getVersion(), readReleaseLookup(userDataDir)) ?? undefined)
+						: undefined,
+					onClose: closeMcp,
 				});
+				if (process.platform === "darwin" && tellsAboutUpdates) {
+					stopWatchingUpdate = watchForMacMcpShutdown(
+						{ executablePath: process.execPath, version: app.getVersion() },
+						() => {
+							// Keep recording, project-save and export runners alive until the client
+							// finishes them. Squirrel can wait; an unfinished take cannot be recovered.
+							if (mcp.isBusy()) return false;
+							safeWrite(
+								process.stderr,
+								"OpenScreen is updating. Restart the MCP server after the app returns.\n",
+							);
+							closeMcp();
+							return true;
+						},
+					);
+				}
 				milestone("mcp server listening on stdio");
+				if (tellsAboutUpdates) {
+					refreshReleaseLookup({
+						userData: userDataDir,
+						currentVersion: app.getVersion(),
+						fetchLatest: (url, init) => net.fetch(url, init),
+					}).catch(() => {
+						// Offline or rate-limited: the next session looks again. Nothing to report,
+						// and stdout is the protocol.
+					});
+				}
 				// An install driven only by an agent is an active install too. Same ping, state
 				// file and opt-outs as the GUI's, and it writes nothing: stdout is the protocol.
 				// The other commands stay silent: they are scripts and CI more often than people.

@@ -71,7 +71,14 @@ impl CursorMode {
     /// pointer stays out of the pixels and the editor draws it from the samples
     /// instead. Any other miss is returned unchanged, for the negotiation to
     /// refuse with its own error.
+    ///
+    /// A portal that offers no mode at all is a version 1 ScreenCast (#1537): it
+    /// predates cursor modes and draws the pointer however it does. That is not
+    /// METADATA, so the take records as EMBEDDED rather than failing.
     pub fn resolve(self, offered: &[CursorMode]) -> CursorMode {
+        if offered.is_empty() {
+            return Self::Embedded;
+        }
         if self == Self::Embedded
             && !offered.contains(&Self::Embedded)
             && offered.contains(&Self::Metadata)
@@ -136,6 +143,8 @@ pub enum PortalError {
     CursorMetadataUnsupported,
     /// The user dismissed the picker, or the portal refused.
     Cancelled,
+    /// Nothing answers on the ScreenCast interface: no portal on this session.
+    Unavailable(String),
     Failed(String),
 }
 
@@ -144,7 +153,7 @@ impl PortalError {
         match self {
             Self::CursorMetadataUnsupported => "cursor-metadata-unsupported",
             Self::Cancelled => "portal-cancelled",
-            Self::Failed(_) => "portal-failed",
+            Self::Unavailable(_) | Self::Failed(_) => "portal-failed",
         }
     }
 
@@ -156,7 +165,7 @@ impl PortalError {
                     .to_owned()
             }
             Self::Cancelled => "The screen capture request was cancelled.".to_owned(),
-            Self::Failed(message) => message.clone(),
+            Self::Unavailable(message) | Self::Failed(message) => message.clone(),
         }
     }
 }
@@ -165,11 +174,27 @@ fn failed(context: &str, error: impl std::fmt::Display) -> PortalError {
     PortalError::Failed(format!("{context}: {error}"))
 }
 
-/// `Screencast::new()` fails when nothing answers on the ScreenCast D-Bus
-/// interface. That is almost never a fault in the session: it is a machine with
-/// no portal BACKEND installed — invisible on any desktop that ships one, which
-/// every distro's desktop metapackage does, and the norm on a minimal install or
-/// a hand-assembled compositor.
+/// Only a portal that is not there is `Unavailable`, which the helper may answer
+/// with direct X11 capture: no frontend implementing ScreenCast, or no portal
+/// service at all (ashpd then succeeds in `Screencast::new()` and the first call
+/// fails). Anything else, a session bus that cannot be reached for one, keeps its
+/// own error.
+fn screencast_error(context: &str, error: ashpd::Error) -> PortalError {
+    match &error {
+        ashpd::Error::PortalNotFound(_) => portal_unavailable(error),
+        ashpd::Error::Zbus(ashpd::zbus::Error::MethodError(name, ..))
+            if name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown" =>
+        {
+            portal_unavailable(error)
+        }
+        _ => failed(context, error),
+    }
+}
+
+/// Nothing answering on the ScreenCast D-Bus interface is almost never a fault
+/// in the session: it is a machine with no portal BACKEND installed — invisible
+/// on any desktop that ships one, which every distro's desktop metapackage does,
+/// and the norm on a minimal install or a hand-assembled compositor.
 ///
 /// This message is not a log line. `message()` is what the helper emits on
 /// `portal-failed`, what `handlers.ts` turns into the IPC error, and what the
@@ -182,7 +207,7 @@ fn failed(context: &str, error: impl std::fmt::Display) -> PortalError {
 /// which backend implements ScreenCast depends on the desktop, so naming the
 /// frontend alone would send someone to install the package they already have.
 fn portal_unavailable(error: impl std::fmt::Display) -> PortalError {
-    PortalError::Failed(format!(
+    PortalError::Unavailable(format!(
         "no ScreenCast portal is available on this session ({error}). Screen capture on Linux \
          goes through xdg-desktop-portal, which needs the backend matching your desktop: \
          xdg-desktop-portal-gnome (GNOME), xdg-desktop-portal-kde (KDE Plasma), \
@@ -192,20 +217,133 @@ fn portal_unavailable(error: impl std::fmt::Display) -> PortalError {
     ))
 }
 
+/// `AvailableCursorModes` and the `cursor_mode` option both came with version 2
+/// of the ScreenCast portal.
+const CURSOR_MODES_VERSION: u32 = 2;
+
+/// Whether this portal has cursor modes. ashpd keeps its own copy of the
+/// version private, so the property is read again (zbus serves it from cache).
+async fn has_cursor_modes(proxy: &Screencast<'_>) -> Result<bool, PortalError> {
+    let version: u32 = proxy
+        .get_property("version")
+        .await
+        .map_err(|error| failed("ScreenCast version", error))?;
+    Ok(version >= CURSOR_MODES_VERSION)
+}
+
+/// `SelectSources` for a version 1 portal, which ashpd cannot send: it always
+/// sets `cursor_mode`, and xdg-desktop-portal rejects any cursor mode its v1
+/// backend did not advertise ("Unavailable cursor mode"), which is all of them.
+/// The same request, minus that option, answered on its Request object.
+async fn select_sources_without_cursor_mode<S>(
+    proxy: &Screencast<'_>,
+    session: &S,
+    types: BitFlags<SourceType>,
+) -> Result<(), PortalError>
+where
+    S: serde::Serialize + ashpd::zvariant::Type,
+{
+    use ashpd::zbus::export::futures_util::StreamExt;
+    use ashpd::zvariant::{OwnedValue, Value};
+    use std::collections::HashMap;
+
+    let token = format!("openscreen{}", std::process::id());
+    let sender = proxy
+        .connection()
+        .unique_name()
+        .ok_or_else(|| PortalError::Failed("SelectSources: no D-Bus unique name".to_owned()))?;
+    let request = ashpd::zbus::Proxy::new(
+        proxy.connection(),
+        "org.freedesktop.portal.Desktop",
+        request_path(sender.as_str(), &token),
+        "org.freedesktop.portal.Request",
+    )
+    .await
+    .map_err(|error| failed("SelectSources", error))?;
+    // Subscribed before the call, or the response can land before the match rule.
+    let mut responses = request
+        .receive_signal("Response")
+        .await
+        .map_err(|error| failed("SelectSources", error))?;
+
+    let options: HashMap<&str, Value> = HashMap::from([
+        ("handle_token", Value::from(token.as_str())),
+        ("types", Value::from(types.bits())),
+        ("multiple", Value::from(false)),
+    ]);
+    proxy
+        .call_method("SelectSources", &(session, options))
+        .await
+        .map_err(|error| failed("SelectSources", error))?;
+
+    let message = responses
+        .next()
+        .await
+        .ok_or_else(|| PortalError::Failed("SelectSources: no response".to_owned()))?;
+    let (code, _): (u32, HashMap<String, OwnedValue>) = message
+        .body()
+        .deserialize()
+        .map_err(|error| failed("SelectSources response", error))?;
+    match code {
+        0 => Ok(()),
+        1 => Err(PortalError::Cancelled),
+        _ => Err(PortalError::Failed(
+            "SelectSources response: Portal request didn't succeed: Other".to_owned(),
+        )),
+    }
+}
+
+/// Where the portal publishes the Request for a call made with `token`.
+fn request_path(unique_name: &str, token: &str) -> String {
+    let sender = unique_name.trim_start_matches(':').replace('.', "_");
+    format!("/org/freedesktop/portal/desktop/request/{sender}/{token}")
+}
+
 /// Cheap, non-interactive probe: which cursor modes does this portal offer?
 ///
 /// Split out from [`negotiate`] so the helper can answer that question — and
 /// emit `ready` — before anything raises a dialog.
+///
+/// A version 1 portal has no `AvailableCursorModes` (it came with version 2), so
+/// it offers none: reading the property there failed every take (#1537).
 pub async fn offered_cursor_modes() -> Result<Vec<CursorMode>, PortalError> {
-    let proxy = Screencast::new().await.map_err(portal_unavailable)?;
+    let proxy = Screencast::new()
+        .await
+        .map_err(|error| screencast_error("ScreenCast", error))?;
+    if !has_cursor_modes(&proxy).await? {
+        return Ok(Vec::new());
+    }
     let cursor_modes = proxy
         .available_cursor_modes()
         .await
-        .map_err(|error| failed("AvailableCursorModes", error))?;
+        .map_err(|error| screencast_error("AvailableCursorModes", error))?;
     Ok([CursorMode::Metadata, CursorMode::Embedded, CursorMode::Hidden]
         .into_iter()
         .filter(|mode| cursor_modes.contains(mode.to_portal()))
         .collect())
+}
+
+/// Whether the portal answers but refuses a session outright, as KDE's does on
+/// X11: its ScreenCast offers cursor modes there, then every take died on
+/// "CreateSession: Portal request didn't succeed: Other" (#1491). Only asking
+/// tells, and asking raises no dialog: `Start()` is what raises the picker.
+pub async fn refuses_sessions() -> bool {
+    let Ok(proxy) = Screencast::new().await else {
+        return false;
+    };
+    match proxy.create_session().await {
+        Ok(session) => {
+            let _ = session.close().await;
+            false
+        }
+        Err(error) => is_refusal(&error),
+    }
+}
+
+/// A response is the portal saying no. Anything else, a bus that cannot be
+/// reached for one, is not an answer, and the take keeps that error.
+fn is_refusal(error: &ashpd::Error) -> bool {
+    matches!(error, ashpd::Error::Response(_))
 }
 
 /// Runs the negotiation to completion. Blocks on the user for as long as the
@@ -216,17 +354,27 @@ pub async fn offered_cursor_modes() -> Result<Vec<CursorMode>, PortalError> {
 /// process-global `OnceLock`, so the portal session stays open until this
 /// process exits — which is exactly the lifetime we want.
 pub async fn negotiate(cursor_mode: CursorMode) -> Result<PortalStream, PortalError> {
-    let proxy = Screencast::new().await.map_err(portal_unavailable)?;
-
-    let cursor_modes = proxy
-        .available_cursor_modes()
+    let proxy = Screencast::new()
         .await
-        .map_err(|error| failed("AvailableCursorModes", error))?;
+        .map_err(|error| screencast_error("ScreenCast", error))?;
+
+    let cursor_modes = if has_cursor_modes(&proxy).await? {
+        proxy
+            .available_cursor_modes()
+            .await
+            .map_err(|error| screencast_error("AvailableCursorModes", error))?
+    } else {
+        BitFlags::empty()
+    };
+    // An empty mask is a version 1 backend, whatever version the frontend
+    // reports: xdg-desktop-portal advertises its own version (5 since 1.18)
+    // and forwards the backend's modes, which a v1 backend does not have.
+    let has_cursor_modes = !cursor_modes.is_empty();
     // Only METADATA is treated as mandatory, and only when it was asked for.
     // EMBEDDED is in the portal spec's baseline and every compositor implements
     // it; refusing to start because a mode we are not using is missing would be
     // the Stage 1 check applied where it no longer belongs.
-    if !cursor_modes.contains(cursor_mode.to_portal()) {
+    if has_cursor_modes && !cursor_modes.contains(cursor_mode.to_portal()) {
         return Err(match cursor_mode {
             CursorMode::Metadata => PortalError::CursorMetadataUnsupported,
             other => PortalError::Failed(format!(
@@ -243,30 +391,34 @@ pub async fn negotiate(cursor_mode: CursorMode) -> Result<PortalStream, PortalEr
     // Monitors and windows both; the picker decides which. Virtual sources are
     // excluded — a virtual monitor has no cursor to report.
     let types: BitFlags<SourceType> = SourceType::Monitor | SourceType::Window;
-    proxy
-        .select_sources(
-            &session,
-            cursor_mode.to_portal(),
-            types,
-            false,
-            // NO RESTORE TOKEN, AND NOTHING TO PERSIST. This used to replay a
-            // token from the previous run so the picker would not reappear —
-            // and that is precisely how "record this window" produced a
-            // recording of the whole screen. A token is bound to the source it
-            // was minted for, so once any monitor had been approved the portal
-            // restored that monitor on every later run and never raised the
-            // picker again; the app had no way to ask for anything else,
-            // because `SelectSources` cannot name a source. The picker IS the
-            // source chooser on Wayland, so suppressing it removed the only
-            // control the user had. Asking every time is the cost of letting
-            // them choose at all.
-            None,
-            PersistMode::DoNot,
-        )
-        .await
-        .map_err(|error| failed("SelectSources", error))?
-        .response()
-        .map_err(|error| failed("SelectSources response", error))?;
+    if !has_cursor_modes {
+        select_sources_without_cursor_mode(&proxy, &session, types).await?;
+    } else {
+        proxy
+            .select_sources(
+                &session,
+                cursor_mode.to_portal(),
+                types,
+                false,
+                // NO RESTORE TOKEN, AND NOTHING TO PERSIST. This used to replay a
+                // token from the previous run so the picker would not reappear —
+                // and that is precisely how "record this window" produced a
+                // recording of the whole screen. A token is bound to the source it
+                // was minted for, so once any monitor had been approved the portal
+                // restored that monitor on every later run and never raised the
+                // picker again; the app had no way to ask for anything else,
+                // because `SelectSources` cannot name a source. The picker IS the
+                // source chooser on Wayland, so suppressing it removed the only
+                // control the user had. Asking every time is the cost of letting
+                // them choose at all.
+                None,
+                PersistMode::DoNot,
+            )
+            .await
+            .map_err(|error| failed("SelectSources", error))?
+            .response()
+            .map_err(|error| failed("SelectSources response", error))?;
+    }
 
     let streams = proxy
         .start(&session, &WindowIdentifier::default())
@@ -315,9 +467,32 @@ mod tests {
     }
 
     #[test]
+    fn only_a_portal_response_is_a_refusal() {
+        use ashpd::desktop::ResponseError;
+        assert!(super::is_refusal(&ashpd::Error::Response(
+            ResponseError::Other
+        )));
+        assert!(!super::is_refusal(&ashpd::Error::NoResponse));
+    }
+
+    #[test]
     fn an_offered_mode_is_kept() {
         assert_eq!(Embedded.resolve(&[Metadata, Embedded]), Embedded);
         assert_eq!(Metadata.resolve(&[Metadata]), Metadata);
+    }
+
+    #[test]
+    fn a_v1_portal_offering_no_mode_records_embedded() {
+        assert_eq!(Metadata.resolve(&[]), Embedded);
+        assert_eq!(Embedded.resolve(&[]), Embedded);
+    }
+
+    #[test]
+    fn the_request_path_follows_the_sender_name() {
+        assert_eq!(
+            super::request_path(":1.42", "openscreen7"),
+            "/org/freedesktop/portal/desktop/request/1_42/openscreen7"
+        );
     }
 
     #[test]

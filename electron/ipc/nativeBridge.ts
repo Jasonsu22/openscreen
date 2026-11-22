@@ -61,6 +61,8 @@ export interface NativeBridgeContext {
 	 */
 	getNativeWindowHandle?: (sender: import("electron").WebContents) => Buffer | null;
 	getAiEditionDocuments: () => DocumentService;
+	/** OpenScreen's recordings folders, the current one first. Absent: deleting a project keeps its recordings. */
+	getRecordingsDirs?: () => { dirs: string[]; registryDir: string };
 	/** The one shared style preset service — it serialises writes per instance. */
 	getStylePresets: () => StylePresetService;
 	getAiEditionLlmConfig: () => import("../ai-edition/llm-config-store").LlmConfigStore;
@@ -198,6 +200,7 @@ function buildChatEventSink(
 		}
 	};
 	return {
+		executionStep: (step) => send({ ...identity, kind: "executionStep", sessionId, step }),
 		document: (document) => send({ ...identity, kind: "document", sessionId, document }),
 		text: (delta) => send({ ...identity, kind: "text", sessionId, delta }),
 		thinking: (delta) => send({ ...identity, kind: "thinking", sessionId, delta }),
@@ -205,6 +208,7 @@ function buildChatEventSink(
 		toolEnd: (name, ok, summary) =>
 			send({ ...identity, kind: "toolEnd", sessionId, name, ok, summary }),
 		error: (message) => send({ ...identity, kind: "error", sessionId, message }),
+		usage: (usage) => send({ ...identity, kind: "usage", sessionId, usage }),
 	};
 }
 
@@ -247,6 +251,13 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		// hit the macOS Keychain) while wiring the bridge at startup.
 		llmConfig: context.getAiEditionLlmConfig,
 		mcp: context.getMcpController?.(),
+		recordings: context.getRecordingsDirs
+			? {
+					dirs: () => context.getRecordingsDirs?.().dirs ?? [],
+					registryDir: () => context.getRecordingsDirs?.().registryDir ?? "",
+					trashItem: (filePath) => shell.trashItem(filePath),
+				}
+			: undefined,
 		runChat: context.runAiEditionChat,
 		undoLastToolBatch: context.undoAiEditionToolBatch,
 		rewindToMessage: context.rewindToMessage,
@@ -564,10 +575,30 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 								requestId,
 								await aiEditionService.save(request.payload.document),
 							);
-						case "document.delete":
+						// Renderer input: anything but "trash" would take the permanent path.
+						case "document.delete": {
+							const disposal: unknown = request.payload.recordings;
+							if (
+								disposal !== undefined &&
+								disposal !== "keep" &&
+								disposal !== "trash" &&
+								disposal !== "permanent"
+							) {
+								return createErrorResponse(
+									requestId,
+									"INVALID_REQUEST",
+									"Invalid recordings disposal.",
+								);
+							}
 							return createSuccessResponse(
 								requestId,
-								await aiEditionService.deleteProject(request.payload.projectId),
+								await aiEditionService.deleteProject(request.payload.projectId, disposal),
+							);
+						}
+						case "document.recordings":
+							return createSuccessResponse(
+								requestId,
+								await aiEditionService.projectRecordings(request.payload.projectId),
 							);
 						case "document.addAsset":
 							return createSuccessResponse(

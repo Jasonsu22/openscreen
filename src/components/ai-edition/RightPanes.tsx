@@ -601,11 +601,17 @@ export function WallpaperPicker({
 	onPickFile,
 }: WallpaperPickerProps) {
 	const ts = useScopedT("settings");
-	// Seeded from what is actually in use, so the picker opens on the tab the user is
-	// already in rather than always on Image.
-	const [tab, setTab] = useState<"image" | "color" | "gradient">(
-		() => classifyWallpaper(value).kind,
-	);
+	// Opens on the tab of what is in use, and follows it when the wallpaper changes kind: the
+	// pane can mount before the project's wallpaper arrives, and a seed taken once read the
+	// default image, so a reopened project with a solid colour showed Image. Browsing a tab
+	// changes no wallpaper, so it is never undone.
+	const kind = classifyWallpaper(value).kind;
+	const [tab, setTab] = useState<"image" | "color" | "gradient">(kind);
+	const [shownKind, setShownKind] = useState(kind);
+	if (kind !== shownKind) {
+		setShownKind(kind);
+		setTab(kind);
+	}
 	// A drag in the colour wheel previews live; the write happens when the picker closes.
 	const live = onLiveChange ?? onChange;
 	const commit = () => void onCommit?.();
@@ -2931,6 +2937,16 @@ export function LayoutPane() {
 			) : null}
 			{isPip ? (
 				<>
+					{/* A cutout camera has no bubble, so no shadow to tune. */}
+					{settings.webcamBackgroundMode !== "transparent"
+						? namedLevelRow(
+								ts("effects.shadow"),
+								SHADOW_LEVELS.map((level) => ({ value: level.value, label: ts(level.labelKey) })),
+								settings.webcamShadowIntensity,
+								layoutControlsDisabled,
+								(webcamShadowIntensity) => void set({ webcamShadowIntensity }),
+							)
+						: null}
 					<div className={styles.sectionLabel}>{ts("layout.webcamShape")}</div>
 					<div style={{ padding: "0 var(--sp-4) 12px" }}>
 						<ChoiceRow<WebcamMask>
@@ -3454,11 +3470,20 @@ export function AudioPane() {
 					onCommit={() => void commit()}
 				/>
 			</div>
+			<div className={styles.paneRow}>
+				<span className={styles.label}>{ts("audio.muteRecording")}</span>
+				<Toggle
+					checked={settings.recordingMuted}
+					disabled={!hasDocument}
+					ariaLabel={ts("audio.muteRecording")}
+					onChange={(v) => void set({ recordingMuted: v })}
+				/>
+			</div>
 			<button
 				type="button"
 				className={styles.secondaryBtn}
 				disabled={!hasDocument}
-				onClick={() => void set({ audioGainDb: 0 })}
+				onClick={() => void set({ audioGainDb: 0, recordingMuted: false })}
 			>
 				{ts("audio.reset")}
 			</button>

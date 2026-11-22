@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer, sharedTexture, webUtils } from "electron";
 import type { NativeLinuxRecordingRequest } from "../src/lib/nativeLinuxRecording";
-import type { NativeMacRecordingRequest } from "../src/lib/nativeMacRecording";
+import type {
+	NativeMacPresenterOverlayEvent,
+	NativeMacRecordingRequest,
+} from "../src/lib/nativeMacRecording";
 import type { NativeWindowsRecordingRequest } from "../src/lib/nativeWindowsRecording";
 import type { RecordingSession, StoreRecordedSessionInput } from "../src/lib/recordingSession";
 import type { ShortcutBinding } from "../src/lib/shortcuts";
@@ -18,6 +21,7 @@ import {
 	NATIVE_BRIDGE_CHANNEL,
 	type NativeBridgeRequest,
 } from "../src/native/contracts";
+import type { UpdateBadge } from "./background-update";
 import type { RecordingPrefs } from "./ipc/handlers";
 import type {
 	SttStatusEvent,
@@ -169,6 +173,32 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	getLastPickedSource: (): Promise<string | null> => {
 		return ipcRenderer.invoke("get-last-picked-source");
 	},
+	prepareCameraPreviewCapture: () =>
+		ipcRenderer.invoke("camera-preview:prepare-capture") as Promise<number | undefined>,
+	restoreCameraPreviewCapture: (token: number) =>
+		ipcRenderer.invoke("camera-preview:restore-capture", token) as Promise<void>,
+	onCameraPreviewAvailability: (callback: (available: boolean) => void) => {
+		const listener = (_event: Electron.IpcRendererEvent, available: boolean) => callback(available);
+		ipcRenderer.on("camera-preview:availability", listener);
+		return () => ipcRenderer.removeListener("camera-preview:availability", listener);
+	},
+	configureCameraPreview: (enabled: boolean, visible: boolean): Promise<void> =>
+		ipcRenderer.invoke("camera-preview:configure", enabled, visible),
+	sendCameraPreviewFrame: (jpeg: string, aspectRatio: number): Promise<void> =>
+		ipcRenderer.invoke("camera-preview:frame", jpeg, aspectRatio),
+	resizeCameraPreview: (width: number): Promise<void> =>
+		ipcRenderer.invoke("camera-preview:resize", width),
+	hideCameraPreview: (): Promise<void> => ipcRenderer.invoke("camera-preview:hide"),
+	onCameraPreviewFrame: (callback: (jpeg: string) => void) => {
+		const listener = (_event: Electron.IpcRendererEvent, jpeg: string) => callback(jpeg);
+		ipcRenderer.on("camera-preview:frame", listener);
+		return () => ipcRenderer.removeListener("camera-preview:frame", listener);
+	},
+	onCameraPreviewHidden: (callback: () => void) => {
+		const listener = () => callback();
+		ipcRenderer.on("camera-preview:hidden", listener);
+		return () => ipcRenderer.removeListener("camera-preview:hidden", listener);
+	},
 	openNotes: () => {
 		return ipcRenderer.invoke("open-notes");
 	},
@@ -236,12 +266,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	getRecordedVideoPath: () => {
 		return ipcRenderer.invoke("get-recorded-video-path");
 	},
+	reportRecordingOutcome: (outcome: import("../src/lib/recordingSession").RecordingOutcome) =>
+		ipcRenderer.invoke("recording-outcome", outcome),
+
 	setRecordingState: (
 		recording: boolean,
 		recordingId?: number,
 		cursorCaptureMode?: import("../src/lib/recordingSession").CursorCaptureMode,
+		reserveOnly?: boolean,
 	) => {
-		return ipcRenderer.invoke("set-recording-state", recording, recordingId, cursorCaptureMode);
+		return ipcRenderer.invoke(
+			"set-recording-state",
+			recording,
+			recordingId,
+			cursorCaptureMode,
+			reserveOnly,
+		);
 	},
 	isNativeWindowsCaptureAvailable: () => {
 		return ipcRenderer.invoke("is-native-windows-capture-available");
@@ -294,6 +334,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	},
 	startNativeMacRecording: (request: NativeMacRecordingRequest) => {
 		return ipcRenderer.invoke("start-native-mac-recording", request);
+	},
+	onNativeMacPresenterOverlayChanged: (
+		callback: (event: NativeMacPresenterOverlayEvent) => void,
+	) => {
+		const listener = (_: unknown, event: NativeMacPresenterOverlayEvent) => callback(event);
+		ipcRenderer.on("native-mac-presenter-overlay-changed", listener);
+		return () => ipcRenderer.removeListener("native-mac-presenter-overlay-changed", listener);
 	},
 	onNativeMacSystemAudioUnavailable: (callback: () => void) => {
 		const listener = () => callback();
@@ -487,10 +534,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	 *  the box is up, NOT when it is dismissed — there is no verdict to wait for, unlike
 	 *  `checkForUpdates` above. */
 	showAbout: () => ipcRenderer.invoke("show-about") as Promise<void>,
+	/** The tray's and the app menu's Save Diagnostics: main asks where, then shows the file. */
+	saveDiagnostics: () => ipcRenderer.invoke("save-diagnostics") as Promise<void>,
 	/** The full update veto, asked fresh. `getAppInfo().canCheckForUpdates` answers only the
 	 *  permanent half; this one also answers "not mid-take", so it is only correct for a caller
 	 *  that asks at the moment it shows the affordance. */
 	canCheckForUpdatesNow: () => ipcRenderer.invoke("can-check-for-updates-now") as Promise<boolean>,
+	/** The update button's state: null hides it. Found by the main process's background check. */
+	getUpdateBadge: () => ipcRenderer.invoke("get-update-badge") as Promise<UpdateBadge | null>,
+	onUpdateBadgeChanged: (callback: (badge: UpdateBadge | null) => void) => {
+		const listener = (_event: unknown, badge: UpdateBadge | null) => callback(badge);
+		ipcRenderer.on("update-badge-changed", listener);
+		return () => ipcRenderer.removeListener("update-badge-changed", listener);
+	},
+	/** The button's click. Resolves at once; the dialogs or the restart that follow are the main
+	 *  process's. */
+	applyUpdate: () => ipcRenderer.invoke("apply-update") as Promise<void>,
 	revealInFolder: (filePath: string) => {
 		return ipcRenderer.invoke("reveal-in-folder", filePath);
 	},
@@ -523,6 +582,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	},
 	updateGlobalShortcut: (binding: ShortcutBinding) => {
 		return ipcRenderer.invoke("update-global-shortcut", binding);
+	},
+	isGlobalShortcutAvailable: (): Promise<boolean> => {
+		return ipcRenderer.invoke("is-global-shortcut-available");
 	},
 	setLocale: (locale: string) => {
 		return ipcRenderer.invoke("set-locale", locale);

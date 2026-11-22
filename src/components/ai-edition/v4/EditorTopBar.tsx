@@ -1,11 +1,13 @@
 import {
 	ChevronDown,
+	CircleArrowDown,
 	Download,
 	FolderOpen,
 	FolderPlus,
 	Info,
 	Keyboard,
 	Languages,
+	LifeBuoy,
 	Moon,
 	PanelLeft,
 	Redo2,
@@ -22,6 +24,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useI18n, useScopedT } from "@/contexts/I18nContext";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { useTheme } from "@/hooks/useTheme";
+import { useUpdateBadge } from "@/hooks/useUpdateBadge";
 import { getAvailableLocales, getLocaleName } from "@/i18n/loader";
 import { moveMenuFocus } from "@/lib/menuKeyboard";
 import { formatFirstFixedBinding } from "@/lib/shortcuts";
@@ -57,6 +60,14 @@ interface EditorTopBarProps {
 	actions: TopBarActions;
 }
 
+/** The update button's click. The main process answers at once; the dialogs or the restart that
+ *  follow are its own. */
+function applyUpdate() {
+	void window.electronAPI?.applyUpdate?.().catch(() => {
+		// The main process logs and reports its own failures.
+	});
+}
+
 const MODES: Array<{ id: EditorMode; labelKey: string }> = [
 	{ id: "media", labelKey: "topbar.modes.media" },
 	{ id: "edit", labelKey: "topbar.modes.edit" },
@@ -76,8 +87,10 @@ export function EditorTopBar({
 }: EditorTopBarProps) {
 	const t = useScopedT("editor");
 	const tShortcuts = useScopedT("shortcuts");
+	const tCommon = useScopedT("common");
 	const { isMac } = useShortcuts();
 	const savedLabel = dirty ? t("topbar.unsaved") : t("topbar.saved");
+	const updateBadge = useUpdateBadge();
 
 	// ponytail: the left side panel only renders in "edit" mode (see
 	// NewEditorShell body), so its toggle is meaningless in Media/Rec —
@@ -112,14 +125,11 @@ export function EditorTopBar({
 				{/* The saved state, as one dot right after the name it is about. Mounted with no
 				    project too, hidden, so loading one moves nothing. Save itself is in the
 				    OpenScreen menu, and on Ctrl+S. */}
-				<span
-					className={styles.saveDot}
-					data-dirty={dirty}
-					data-hidden={!projectTitle}
-					title={savedLabel}
-				>
-					<span className="sr-only">{savedLabel}</span>
-				</span>
+				<Tooltip content={savedLabel} open={!projectTitle ? false : undefined}>
+					<span className={styles.saveDot} data-dirty={dirty} data-hidden={!projectTitle}>
+						<span className="sr-only">{savedLabel}</span>
+					</span>
+				</Tooltip>
 			</span>
 
 			<div className={styles.modeSwitch} role="tablist" aria-label={t("topbar.editorMode")}>
@@ -175,6 +185,19 @@ export function EditorTopBar({
 				</button>
 			</Tooltip>
 			<StylePresetsMenu />
+			{updateBadge ? (
+				<Tooltip content={tCommon("actions.updateTo", { version: updateBadge.version })}>
+					<button
+						type="button"
+						className={styles.updateBtn}
+						aria-label={tCommon("actions.updateTo", { version: updateBadge.version })}
+						onClick={applyUpdate}
+					>
+						<CircleArrowDown size={15} />
+						<span className={styles.updateLabel}>{tCommon("actions.update")}</span>
+					</button>
+				</Tooltip>
+			) : null}
 			<button
 				type="button"
 				className={styles.exportBtn}
@@ -250,9 +273,10 @@ function ProjectNameField({
 
 /** The brand doubles as the application menu.
  *
- *  Windows and Linux have no visible menu bar to put About and the update check in: this bar
+ *  Windows and Linux have no visible menu bar to put About, the update check and Save
+ *  Diagnostics in: this bar
  *  IS the titlebar (createEditorWindow passes titleBarStyle:"hidden"), and the native menu is
- *  behind setAutoHideMenuBar(true) — so those two items were reachable only from the tray, or
+ *  behind setAutoHideMenuBar(true) — so those items were reachable only from the tray, or
  *  by holding Alt, which is to say not reachable. Hanging them off the wordmark is what Figma,
  *  Linear and Slack do under the same constraint.
  *
@@ -263,7 +287,7 @@ function ProjectNameField({
  *
  *  No row invents a label. Each one reuses the key of the thing it opens: `common.actions.*`
  *  for the rows electron/main.ts also builds native menu items from (About, Check for
- *  Updates), and the dialog's own title key for the rows that open a dialog (`shortcuts.title`,
+ *  Updates, Save Diagnostics), and the dialog's own title key for the rows that open a dialog (`shortcuts.title`,
  *  `editor.providerSettings.title`). That is what stops this menu from drifting away from the
  *  native menu on one side and from what its rows actually open on the other — and it is why
  *  this component adds no translation work. */
@@ -509,6 +533,19 @@ function AppMenu({ actions }: { actions: TopBarActions }) {
 						<Info size={15} />
 						{tCommon("actions.about")}
 						{version ? <span className={styles.appMenuVersion}>{version}</span> : null}
+					</button>
+					<button
+						type="button"
+						role="menuitem"
+						className={styles.appMenuRow}
+						onClick={run(() => {
+							void window.electronAPI
+								?.saveDiagnostics?.()
+								.catch((err) => console.warn("[diagnostics] could not save:", err));
+						})}
+					>
+						<LifeBuoy size={15} />
+						{tCommon("actions.saveDiagnostics")}
 					</button>
 					{/* The permanent way to reach the repo, as opposed to the one-time ask after an
 					    export. Unconditional: unlike the update check above, a link to the repo root

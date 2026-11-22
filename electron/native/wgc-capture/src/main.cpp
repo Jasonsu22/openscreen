@@ -10,7 +10,8 @@
 #include "wasapi_render_keepalive.h"
 #include "frame_visibility.h"
 #include "webcam_capture.h"
-#include "wgc_session.h"
+#include "webcam_preview.h"
+#include "capture_session.h"
 
 #include <winrt/Windows.Foundation.h>
 
@@ -39,6 +40,7 @@ struct CaptureConfig {
     std::string windowHandle;
     std::string outputPath;
     std::string webcamOutputPath;
+    std::string webcamPreviewPath;
     int fps = 60;
     int width = 0;
     int height = 0;
@@ -49,6 +51,9 @@ struct CaptureConfig {
     bool captureCursor = false;
     bool webcamEnabled = false;
     bool preferSoftwareEncoder = false;
+    // Adapters on which the hardware encoder stalled before, one per line: the
+    // app remembers them (getopenscreen/openscreen#1544).
+    std::string softwareEncoderAdapters;
     bool hideDesktopIcons = false;
     std::string microphoneDeviceId;
     std::string microphoneDeviceName;
@@ -234,29 +239,31 @@ std::string formatLuid(const LUID& luid) {
 // This does not change behaviour, and deliberately so: it turns the next bug
 // report into evidence instead of another round of guessing. Failures here are
 // silent -- a diagnostic that can abort a recording is worse than no diagnostic.
-void reportCaptureAdapters(ID3D11Device* device, HMONITOR targetMonitor) {
+// Returns the device adapter's description, empty if it could not be read.
+std::string reportCaptureAdapters(ID3D11Device* device, HMONITOR targetMonitor) {
     if (!device) {
-        return;
+        return {};
     }
 
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)))) {
-        return;
+        return {};
     }
     Microsoft::WRL::ComPtr<IDXGIAdapter> deviceAdapter;
     if (FAILED(dxgiDevice->GetAdapter(&deviceAdapter))) {
-        return;
+        return {};
     }
     DXGI_ADAPTER_DESC deviceDesc{};
     if (FAILED(deviceAdapter->GetDesc(&deviceDesc))) {
-        return;
+        return {};
     }
+    const std::string deviceAdapterName = wideToUtf8(deviceDesc.Description);
 
     // The device's own adapter knows its factory, so there is no need to create
     // one (and no second code path to keep alive if that ever needs a flag).
     Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
     if (FAILED(deviceAdapter->GetParent(IID_PPV_ARGS(&factory)))) {
-        return;
+        return deviceAdapterName;
     }
 
     std::wstring monitorAdapterName;
@@ -394,6 +401,7 @@ void reportCaptureAdapters(ID3D11Device* device, HMONITOR targetMonitor) {
         }
         std::cerr << std::endl;
     }
+    return deviceAdapterName;
 }
 
 
@@ -579,6 +587,7 @@ bool parseConfig(const std::string& json, CaptureConfig& config) {
     config.captureCursor = findBool(json, "captureCursor", false);
     config.webcamEnabled = findBool(json, "webcamEnabled", false);
     config.preferSoftwareEncoder = findBool(json, "preferSoftwareEncoder", false);
+    config.softwareEncoderAdapters = findString(json, "softwareEncoderAdapters");
     config.hideDesktopIcons = findBool(json, "hideDesktopIcons", false);
     config.microphoneDeviceId = findString(json, "microphoneDeviceId");
     config.microphoneDeviceName = findString(json, "microphoneDeviceName");
@@ -587,6 +596,7 @@ bool parseConfig(const std::string& json, CaptureConfig& config) {
     config.webcamDeviceName = findString(json, "webcamDeviceName");
     config.webcamDirectShowClsid = findString(json, "webcamDirectShowClsid");
     config.webcamOutputPath = findString(json, "webcamPath");
+    config.webcamPreviewPath = findString(json, "webcamPreviewPath");
     config.webcamWidth = findInt(json, "webcamWidth", 0);
     config.webcamHeight = findInt(json, "webcamHeight", 0);
     config.webcamFps = findInt(json, "webcamFps", 0);
@@ -704,7 +714,7 @@ int wmain(int argc, wchar_t* argv[]) {
     // Declared before the session so it outlives it: the icons come back only
     // once nothing is recording any more.
     DesktopIconCover desktopIconCover;
-    WgcSession session;
+    CaptureSession session;
     HMONITOR capturedMonitor = nullptr;
     if (config.sourceType == "display") {
         HMONITOR monitor = findMonitorForCapture(
@@ -716,7 +726,9 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         capturedMonitor = monitor;
         if (!session.initialize(monitor, config.fps, config.captureCursor)) {
-            std::cerr << "ERROR: Failed to initialize WGC display session" << std::endl;
+            std::cerr << "ERROR: Failed to initialize display capture: Windows Graphics Capture "
+                         "was refused and DXGI Desktop Duplication could not start either"
+                      << std::endl;
             return 1;
         }
         // Before `recording-started`, so the first frame is already clean. A cover
@@ -741,7 +753,7 @@ int wmain(int argc, wchar_t* argv[]) {
         const bool includeSecondaryWindows =
             readEnvInt("OPENSCREEN_WGC_DISABLE_SECONDARY_WINDOWS", 0) != 1;
         if (!session.initialize(window, config.fps, config.captureCursor, includeSecondaryWindows)) {
-            std::cerr << "ERROR: Failed to initialize WGC window session" << std::endl;
+            std::cerr << "ERROR: Failed to initialize window capture (Windows Graphics Capture)" << std::endl;
             return 1;
         }
     } else {
@@ -749,15 +761,29 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    reportCaptureAdapters(session.device(), capturedMonitor);
+    const std::string captureAdapterName = reportCaptureAdapters(session.device(), capturedMonitor);
+    if (!captureAdapterName.empty() &&
+        ("\n" + config.softwareEncoderAdapters + "\n").find("\n" + captureAdapterName + "\n") !=
+            std::string::npos) {
+        std::cerr << "INFO: The hardware encoder stalled on this adapter before; "
+                  << "using the software encoder." << std::endl;
+        config.preferSoftwareEncoder = true;
+    }
 
-    // WGC owns the captured texture size. Encoding must use that exact size
-    // until a dedicated GPU scaling pass is introduced; CopyResource requires
-    // matching resource dimensions.
-    int width = session.captureWidth();
-    int height = session.captureHeight();
-    width = (std::max(2, width) / 2) * 2;
-    height = (std::max(2, height) / 2) * 2;
+    // WGC owns the captured texture size, and the encoder uses it as it is
+    // whenever H.264 can take it. A frame too large for any H.264 encoder -- a
+    // 5120x2160 screen (getopenscreen/openscreen#1514) -- is scaled down on
+    // the GPU to the size fitH264FrameSize picks.
+    const int captureWidth = (std::max(2, session.captureWidth()) / 2) * 2;
+    const int captureHeight = (std::max(2, session.captureHeight()) / 2) * 2;
+    const FrameSize encodeSize = fitH264FrameSize(captureWidth, captureHeight, config.fps);
+    const int width = encodeSize.width;
+    const int height = encodeSize.height;
+    if (width != captureWidth || height != captureHeight) {
+        std::cout << "{\"event\":\"encode-size\",\"schemaVersion\":2,\"captureWidth\":" << captureWidth
+                  << ",\"captureHeight\":" << captureHeight << ",\"width\":" << width
+                  << ",\"height\":" << height << "}" << std::endl;
+    }
 
     const int pixels = width * height;
     const int bitrate = pixels >= 3840 * 2160 ? 45'000'000 : pixels >= 2560 * 1440 ? 28'000'000 : 18'000'000;
@@ -929,6 +955,10 @@ int wmain(int argc, wchar_t* argv[]) {
         readEnvInt("OPENSCREEN_WGC_ENABLE_DXGI_INPUT", 0) == 1 &&
         !config.preferSoftwareEncoder &&
         (!config.webcamEnabled || writeSeparateWebcam);
+    if (width != captureWidth || height != captureHeight) {
+        encoderOptions.sourceWidth = captureWidth;
+        encoderOptions.sourceHeight = captureHeight;
+    }
 
     MFEncoder encoder;
     if (!encoder.initialize(
@@ -972,6 +1002,8 @@ int wmain(int argc, wchar_t* argv[]) {
         MFEncoderOptions webcamEncoderOptions = encoderOptions;
         webcamEncoderOptions.injectDefaultSinkWriterFailureOnce = false;
         webcamEncoderOptions.useDxgiInput = false;
+        webcamEncoderOptions.sourceWidth = 0;
+        webcamEncoderOptions.sourceHeight = 0;
         // The two-step ladder this replaces topped out at 8 Mbit/s for anything
         // 720p or larger. That was sized for a camera nobody had configured
         // above 640x480; now that the capture runs at the camera's real
@@ -1011,7 +1043,9 @@ int wmain(int argc, wchar_t* argv[]) {
     // OPENSCREEN_WGC_LEGACY_FRAME_CALLBACK=1 reverts to the previously
     // shipped push-based design (frameMutex/frameCv guard the handoff from
     // WGC's own callback thread) as a rollback lever -- see wgc_session.h.
-    const bool legacyFrameCallback = useLegacyFrameCallback();
+    // The DXGI fallback is pull-only (see capture_session.h), so the legacy
+    // FrameArrived rollback lever only means anything on the WGC backend.
+    const bool legacyFrameCallback = useLegacyFrameCallback() && !session.usingDxgi();
     CaptureControl control;
     std::atomic<bool> firstFrameWritten = false;
     std::atomic<bool> encodeFailed = false;
@@ -1075,6 +1109,10 @@ int wmain(int argc, wchar_t* argv[]) {
         const auto frameDuration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(1.0 / config.fps));
         uint64_t frameIndex = 0;
+        // Ticks that pulled a new screen frame. frameIndex counts every tick,
+        // repeats included, so it cannot show a capture that only delivers
+        // every other frame (#510).
+        uint64_t uniqueFrames = 0;
         int64_t lastEncodedVideoTimestampHns = -1;
         int64_t lastWebcamTimestampHns = -1;
         // Both streams are written on a real-time cadence, one FrameSlotClock
@@ -1162,6 +1200,23 @@ int wmain(int argc, wchar_t* argv[]) {
                                 break;
                             }
                         }
+                        // A display mode change mid-take (resolution, scale)
+                        // hands over frames of a new size. The encoder was set
+                        // up for the first one, and CopyResource between
+                        // mismatched textures is undefined, so end the take
+                        // with a clear error instead of recording garbage.
+                        D3D11_TEXTURE2D_DESC frameDesc{};
+                        D3D11_TEXTURE2D_DESC latestDesc{};
+                        wgcTexture->GetDesc(&frameDesc);
+                        latestFrameTexture->GetDesc(&latestDesc);
+                        if (frameDesc.Width != latestDesc.Width || frameDesc.Height != latestDesc.Height) {
+                            std::cerr << "ERROR: Capture size changed mid-recording (" << latestDesc.Width
+                                      << "x" << latestDesc.Height << " -> " << frameDesc.Width << "x"
+                                      << frameDesc.Height << "); ending the take" << std::endl;
+                            encodeFailed = true;
+                            control.requestStop();
+                            break;
+                        }
                         // The wedge risk this class exists to avoid: this call
                         // can block inside the display driver and never return
                         // (#252, still true of PR #305's DXGI path on some
@@ -1170,6 +1225,8 @@ int wmain(int argc, wchar_t* argv[]) {
                         // separate WGC callback thread left for it to take a
                         // lock down with it.
                         session.context()->CopyResource(latestFrameTexture.Get(), wgcTexture);
+                        session.releaseFrame();
+                        uniqueFrames += 1;
                         firstFrameWritten = true;
                     } else if (!latestFrameTexture) {
                         // No frame captured yet at all: nothing to encode
@@ -1332,11 +1389,14 @@ int wmain(int argc, wchar_t* argv[]) {
                     Hns(videoClock.nextDueHns() - nowHns)),
                 frameDuration));
         }
-        std::cerr << "[pacing] frames=" << frameIndex << " elapsed_ms="
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - control.recordingStartedAt)
-                         .count()
-                  << " last_sample_ms=" << lastEncodedVideoTimestampHns / 10'000 << std::endl;
+        const auto pacingElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - control.recordingStartedAt)
+                                         .count();
+        std::cerr << "[pacing] frames=" << frameIndex << " elapsed_ms=" << pacingElapsedMs
+                  << " last_sample_ms=" << lastEncodedVideoTimestampHns / 10'000
+                  << " unique_frames=" << uniqueFrames << " unique_fps="
+                  << (pacingElapsedMs > 0 ? uniqueFrames * 1000.0 / pacingElapsedMs : 0.0)
+                  << std::endl;
     };
 
     std::thread videoWriterThread;
@@ -1468,6 +1528,8 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
+    WebcamPreview webcamPreview(webcamCapture, config.webcamEnabled ? utf8ToWide(config.webcamPreviewPath) : L"");
+
     if (!session.start()) {
         webcamCapture.stop();
         microphoneCapture.stop();
@@ -1477,7 +1539,8 @@ int wmain(int argc, wchar_t* argv[]) {
         if (audioMixer) {
             audioMixer->stop();
         }
-        std::cerr << "ERROR: Failed to start WGC session" << std::endl;
+        std::cerr << "ERROR: Failed to start native capture session (" << session.backendName() << ")"
+              << std::endl;
         return 1;
     }
 
@@ -1747,7 +1810,26 @@ int wmain(int argc, wchar_t* argv[]) {
     // means wgcDrained was true above: the branch that was not is a
     // TerminateProcess call, not a fallthrough.
     beginStopStep("encoder-finalize", shutdownBudgetMs);
+    // A hardware encoder that stalled in Finalize() is still inside it on a
+    // detached thread: nothing after this is safe, and waiting out the
+    // watchdog only costs the user time. The event names the adapter so the
+    // app records the next take on the software encoder. Whatever fragments
+    // reached the disk stay there for the app's salvage.
+    auto abandonStalledEncoder = [&](const char* step) {
+        std::cerr << "[stop-timing] step=" << step << " elapsed_ms=" << stopElapsedMs()
+                  << " phase=abandoned reason=hardware-encoder-stalled" << std::endl;
+        std::cout << "{\"event\":\"hardware-encoder-stalled\",\"schemaVersion\":2,\"adapter\":\""
+                  << jsonEscape(captureAdapterName) << "\"}" << std::endl;
+        std::cout << "{\"event\":\"stop-timeout\",\"schemaVersion\":2,\"step\":\"" << step
+                  << "\"}" << std::endl;
+        std::cout.flush();
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), 3);
+    };
     const bool screenFinalized = encoder.finalize();
+    if (encoder.hardwareEncoderStalled()) {
+        abandonStalledEncoder("encoder-finalize");
+    }
     logStopStep("encoder-finalize");
     if (!screenFinalized) {
         std::cerr << "ERROR: Failed to finalize the recording" << std::endl;
@@ -1783,6 +1865,9 @@ int wmain(int argc, wchar_t* argv[]) {
     if (writeSeparateWebcam) {
         beginStopStep("webcam-encoder-finalize", shutdownBudgetMs);
         webcamFinalized = webcamEncoder.finalize();
+        if (webcamEncoder.hardwareEncoderStalled()) {
+            abandonStalledEncoder("webcam-encoder-finalize");
+        }
         logStopStep("webcam-encoder-finalize");
         if (!webcamFinalized) {
             std::cerr << "ERROR: Failed to finalize the webcam recording" << std::endl;

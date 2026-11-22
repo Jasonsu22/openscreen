@@ -44,6 +44,15 @@ type WhisperChild = ChildProcessByStdio<null, Readable, Readable>;
 const REQUEST_TIMEOUT_MS = 280_000;
 
 /**
+ * Decode threads: half the logical cores, i.e. the physical cores on an SMT CPU.
+ * Every logical core (12 on a 6-core i7) oversubscribes ggml, which slows it on
+ * hyperthreads, and leaves nothing for the recorder or the UI (#1594).
+ */
+export function inferenceThreads(logicalCores = os.cpus().length): number {
+	return Math.max(1, Math.floor(logicalCores / 2));
+}
+
+/**
  * Owns the long-lived `whisper-stt-server` process used to recognize speech.
  *
  * Replaces the previous native STT helper with the same shape: spawn → poll
@@ -293,13 +302,22 @@ export class WhisperServerManager {
 				"--host",
 				"127.0.0.1",
 				"--threads",
-				String(Math.max(1, os.cpus().length)),
+				String(inferenceThreads()),
 			];
 			if (options.vadModelPath && existsSync(options.vadModelPath)) {
 				args.push("--vad-model", options.vadModelPath);
 			}
 			if (forceCpu) args.push("--cpu");
 			const child = spawn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+			// Background work: below the recorder and the UI, so a CPU-bound decode on a
+			// machine without a usable GPU cannot starve them (#1594).
+			if (child.pid) {
+				try {
+					os.setPriority(child.pid, 10);
+				} catch {
+					// Not fatal: the helper just runs at normal priority.
+				}
+			}
 			const activeBackend: SttBackend = forceCpu ? "whispercpp-cpu" : resolved.backend;
 
 			this.process = child;
@@ -381,8 +399,16 @@ export class WhisperServerManager {
 			return { port, backend: activeBackend };
 		};
 
+		// A CPU-labelled helper runs with `--cpu` from its first launch. The label does
+		// not make the binary CPU-only: ggml turns Metal on by default for every Apple
+		// build, so the macOS x64 helper carries it, and without the flag whisper.cpp
+		// decodes on the Intel iGPU — which hung the UHD 630 render ring (#1594).
+		// An explicit `binaryPath` with no backend is auto: its CPU default above is only
+		// a label, so it does not force the flag.
+		const cpuLabelled =
+			(options.binaryPath ? options.backend : resolved.backend) === "whispercpp-cpu";
 		try {
-			return await launch(false);
+			return await launch(cpuLabelled);
 		} catch (err) {
 			const startupLog = `${err instanceof Error ? err.message : String(err)} ${this.stderrTail}`;
 			const startupLines = startupLog.split(/\r?\n/);
@@ -511,6 +537,12 @@ export class WhisperServerManager {
 				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 			});
 		} catch (error) {
+			const timedOut = error instanceof Error && error.name === "TimeoutError";
+			// The helper does not notice the client left: it keeps decoding the abandoned
+			// chunk while holding its inference lock, so the retry queued behind it and
+			// timed out too, and the helper ground on all of them at full CPU long after
+			// the run had failed (#1594). Kill it; the retry respawns a fresh one.
+			if (timedOut) await this.stop();
 			// Name the failure. Node's global fetch reports BOTH a real transport
 			// error and its own header timeout as a bare "fetch failed", which is
 			// how a too-long request used to reach the user as an unactionable
@@ -525,7 +557,7 @@ export class WhisperServerManager {
 			// project targets ES2020, where that overload does not exist.
 			throw Object.assign(
 				new Error(
-					error instanceof Error && error.name === "TimeoutError"
+					timedOut
 						? `whisper-stt-server /inference timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s ` +
 								`(audio chunk too long for this machine, or the helper is wedged); ` +
 								`stderr=${this.stderrTail.slice(-256)}`

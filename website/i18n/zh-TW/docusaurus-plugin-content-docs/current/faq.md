@@ -34,9 +34,9 @@ OpenScreen 是一款採用 MIT 授權的免費螢幕錄影與影片剪輯軟體�
 
 - **huggingface.co，只有一次。** 第一次轉錄時會下載 Whisper 模型（約 264 MB）與一個小於 1 MB 的語音偵測模型，每個都以 SHA-256 雜湊值驗證。之後轉錄就不再需要網路連線。
 - **github.com，每種語言一次。** 在有 GPU 的電腦上，第一次進行英文或法文轉錄時，還會下載為每個字詞重新對時的模型：英文約 110 MB，法文約 350 MB。
-- **github.com 與 api.github.com。** 會自行更新的版本每 24 小時檢查一次新版本，你手動要求時也會檢查。預設只會通知你有新版本可用。
+- **github.com 與 api.github.com。** 會自行更新的版本在啟動一分鐘後檢查一次新版本，之後每六小時檢查一次，你手動要求時也會檢查。它們會在背景下載新版本並顯示更新按鈕；在你點擊之前不會安裝任何內容。
 - **fonts.googleapis.com，僅限 1.x 中加入的字體。** 在先前版本中加入的自訂標註字體仍會在啟動時載入，儘管 2.x 已不再繪製它。
-- **PostHog，每天一次。** 活躍安裝數的匿名計數，會送到 PostHog 位於歐盟的伺服器。內容包括應用程式版本、作業系統、處理器架構、應用程式的安裝方式、應用程式是直接使用還是由 AI 代理透過其 MCP 伺服器使用，以及這是否為當週與當月的第一次計數。僅此而已：沒有安裝識別碼（每次計數都使用新的隨機 ID），不保留 IP 位址，也不含任何與你錄影有關的資訊。若要關閉，請在系統匣選單中取消勾選**傳送匿名使用計數**，或設定 `DO_NOT_TRACK=1`。
+- **PostHog，每天一次。** 活躍安裝數的匿名計數，會送到 PostHog 位於歐盟的伺服器。內容包括應用程式版本、作業系統、處理器架構、應用程式的安裝方式、應用程式是直接使用還是由 AI 代理透過其 MCP 伺服器使用，這是否為當週與當月的第一次計數，以及應用程式的安裝週。僅此而已：沒有安裝識別碼（每次計數都使用新的隨機 ID），不保留 IP 位址，也不含任何與你錄影有關的資訊。若要關閉，請在系統匣選單中取消勾選**傳送匿名使用計數**，或設定 `DO_NOT_TRACK=1`。
 - **你的 AI 提供者，僅在你連接時。** 聊天剪輯會送出你的訊息，以及它讀取的專案資料，例如時間軸與逐字稿。字幕翻譯會送出字幕文字。在你連接提供者之前，這兩項功能都保持關閉。請參閱 [AI 剪輯](./ai-editing.md)。
 
 ## OpenScreen 會收集分析資料或當機報告嗎？ {#does-openscreen-collect-analytics-or-crash-reports}
@@ -44,7 +44,7 @@ OpenScreen 是一款採用 MIT 授權的免費螢幕錄影與影片剪輯軟體�
 **每天一次匿名計數，除此之外沒有別的。** 應用程式中沒有任何分析或當機回報 SDK，也沒有任何機制會記錄你在其中的操作。
 
 - 應用程式每天回報一次有一個安裝處於活躍狀態。[OpenScreen 可以離線使用嗎？](#does-openscreen-work-offline)準確列出這項計數包含的內容與關閉方式。
-- 這項計數不帶安裝識別碼：每次計數都使用新的隨機 ID，其中也沒有其他專屬於你電腦的資訊。
+- 這項計數不帶安裝識別碼：每次計數都使用新的隨機 ID，其中也沒有其他專屬於你電腦的資訊。其中的安裝週（例如 `2026-W44`）就是安裝的那一週，同一週安裝的所有人都相同，並非識別碼。
 - AI 提供者的金鑰會透過 Electron 的 `safeStorage` 加密儲存。如果無法加密，金鑰就不會被儲存。
 
 ## 安裝 OpenScreen 安全嗎？ {#is-openscreen-safe-to-install}
@@ -79,7 +79,7 @@ OpenScreen 是一款採用 MIT 授權的免費螢幕錄影與影片剪輯軟體�
 ## 可以用 winget、Homebrew 或 Flathub 安裝 OpenScreen 嗎？ {#can-i-install-openscreen-with-winget-homebrew-or-flathub}
 
 - **winget：** 可以，透過 Store 來源安裝：`winget install --source msstore OpenScreen`。
-- **Homebrew：** 可以，透過官方 tap 安裝：`brew install --cask getopenscreen/openscreen/openscreen`。每次發布穩定版都會更新這個 cask。
+- **Homebrew：** 可以。從 Homebrew 主 cask 清單安裝：`brew install --cask openscreen`，或透過官方 tap 安裝：`brew install --cask getopenscreen/openscreen/openscreen`。兩者都會隨每個穩定版更新。舊的 `siddharthvaddem/openscreen` tap 停留在 v1.5.0。
 - **Flathub：** 沒有上架。
 
 ## 這是原始的 OpenScreen 專案嗎？ {#is-this-the-original-openscreen-project}
@@ -88,7 +88,7 @@ OpenScreen 是一款採用 MIT 授權的免費螢幕錄影與影片剪輯軟體�
 
 - Siddharth Vaddem 建立了 OpenScreen，並在 v1.5.0 之後封存了[原始儲存庫](https://github.com/siddharthvaddem/openscreen)。
 - 在他的同意下，開發工作移到了 [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen)，沿用相同的名稱與相同的 MIT 授權。
-- 已封存的 README 稱本專案為由一位核心貢獻者主導、社群驅動的衍生專案。這位貢獻者就是負責維護本專案的 Etienne Lescot。README 中的連結 github.com/EtienneLescot/openscreen 會重新導向到目前的儲存庫。
+- 已封存的 README 現在指向本儲存庫。本專案由原專案的核心貢獻者之一 Etienne Lescot 維護。
 - 已封存的儲存庫不會再有任何更新。交接經過請見 [Picking up OpenScreen（英文部落格文章）](/blog/2026/06/15/picking-up-openscreen/)。
 
 ## OpenScreen 和 openscreen.io 或 openscreen.net 有關嗎？ {#is-openscreen-related-to-openscreenio-or-openscreennet}

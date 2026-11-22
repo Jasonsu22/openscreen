@@ -351,7 +351,12 @@
 		"done": "Done",
 		"ratio": "Ratio",
 		"cropVideo": "Crop Video",
-		"lockAspectRatio": "Lock aspect ratio"
+		"lockAspectRatio": "Lock aspect ratio",
+		"x": "X (px)",
+		"y": "Y (px)",
+		"width": "Width (px)",
+		"height": "Height (px)",
+		"position": "Crop position and size in pixels"
 	},
 	"zoom": {
 		"position": {
@@ -388,6 +393,7 @@
 	},
 	"audio": {
 		"outputGain": "Output level",
+		"muteRecording": "Mute recording",
 		"help": "Voices are levelled to a standard loudness automatically. Adjust the output level from there; it applies identically in the preview and the export.",
 		"reset": "Reset audio",
 		"title": "Audio"

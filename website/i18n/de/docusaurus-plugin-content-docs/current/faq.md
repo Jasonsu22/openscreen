@@ -34,9 +34,9 @@ OpenScreen ist ein kostenloser Bildschirmrekorder und Videoeditor unter MIT-Lize
 
 - **huggingface.co, einmalig.** Die erste Transkription lädt das Whisper-Modell herunter, etwa 264 MB, und ein Modell zur Spracherkennung unter 1 MB, jedes gegen einen SHA-256-Hash geprüft. Danach braucht die Transkription keine Verbindung mehr.
 - **github.com, einmal pro Sprache.** Auf einem Rechner mit GPU lädt die erste englische oder französische Transkription zusätzlich das Modell herunter, das jedes Wort neu zeitlich ausrichtet: etwa 110 MB für Englisch, 350 MB für Französisch.
-- **github.com und api.github.com.** Builds, die sich selbst aktualisieren, suchen alle 24 Stunden und auf deine Anfrage nach einer neuen Version. Standardmäßig melden sie nur, dass eine verfügbar ist.
+- **github.com und api.github.com.** Builds, die sich selbst aktualisieren, suchen eine Minute nach dem Start, dann alle sechs Stunden und auf deine Anfrage nach einer neuen Version. Sie laden sie im Hintergrund herunter und zeigen eine Update-Schaltfläche; installiert wird erst, wenn du darauf klickst.
 - **fonts.googleapis.com, nur für eine in 1.x hinzugefügte Schrift.** Eine eigene Schrift für Annotationen, die in einer früheren Version hinzugefügt wurde, wird beim Start weiterhin geladen, obwohl 2.x sie nicht mehr zeichnet.
-- **PostHog, einmal täglich.** Eine anonyme Zählung aktiver Installationen, gesendet an die EU-Server von PostHog. Sie enthält die App-Version, das Betriebssystem, die Prozessorarchitektur, die Art der Installation, ob die App direkt oder über ihren MCP-Server von einem KI-Agenten genutzt wurde, und ob es die erste Zählung der Woche und des Monats ist. Mehr nicht: keine Installationskennung (jede Zählung erhält eine neue Zufalls-ID), keine gespeicherte IP-Adresse, nichts über deine Aufnahmen. Entferne im Menü des Symbols im Infobereich das Häkchen bei **Anonyme Nutzungszählung senden**, um sie abzuschalten, oder setze `DO_NOT_TRACK=1`.
+- **PostHog, einmal täglich.** Eine anonyme Zählung aktiver Installationen, gesendet an die EU-Server von PostHog. Sie enthält die App-Version, das Betriebssystem, die Prozessorarchitektur, die Art der Installation, ob die App direkt oder über ihren MCP-Server von einem KI-Agenten genutzt wurde, ob es die erste Zählung der Woche und des Monats ist und in welcher Woche die App installiert wurde. Mehr nicht: keine Installationskennung (jede Zählung erhält eine neue Zufalls-ID), keine gespeicherte IP-Adresse, nichts über deine Aufnahmen. Entferne im Menü des Symbols im Infobereich das Häkchen bei **Anonyme Nutzungszählung senden**, um sie abzuschalten, oder setze `DO_NOT_TRACK=1`.
 - **Dein KI-Anbieter, nur wenn du einen verbindest.** Die Chat-Bearbeitung sendet deine Nachrichten und die Projektdaten, die sie liest, etwa Zeitleiste und Transkript. Die Untertitelübersetzung sendet den Untertiteltext. Beides bleibt aus, bis du einen Anbieter verbindest. Siehe [KI-Bearbeitung](./ai-editing.md).
 
 ## Sammelt OpenScreen Analysedaten oder Absturzberichte? {#does-openscreen-collect-analytics-or-crash-reports}
@@ -44,7 +44,7 @@ OpenScreen ist ein kostenloser Bildschirmrekorder und Videoeditor unter MIT-Lize
 **Eine anonyme tägliche Zählung, sonst nichts.** Die App enthält kein SDK für Analysen oder Absturzberichte, und nichts zeichnet auf, was du in ihr tust.
 
 - Einmal täglich meldet die App, dass eine Installation aktiv war. [Funktioniert OpenScreen offline?](#does-openscreen-work-offline) listet genau auf, was diese Zählung enthält und wie du sie abschaltest.
-- Die Zählung trägt keine Installationskennung: Jede erhält eine neue Zufalls-ID, und nichts anderes darin ist spezifisch für deinen Computer.
+- Die Zählung trägt keine Installationskennung: Jede erhält eine neue Zufalls-ID, und nichts anderes darin ist spezifisch für deinen Computer. Die Installationswoche darin, etwa `2026-W44`, ist die Woche der Installation, für alle gleich, die in dieser Woche installiert haben, und keine Kennung.
 - API-Schlüssel für KI-Anbieter werden verschlüsselt mit Electrons `safeStorage` gespeichert. Ist keine Verschlüsselung verfügbar, wird der Schlüssel nicht gespeichert.
 
 ## Ist die Installation von OpenScreen sicher? {#is-openscreen-safe-to-install}
@@ -79,7 +79,7 @@ Unter [Installation](./installation.md) stehen die Schritte für jede Plattform.
 ## Kann ich OpenScreen mit winget, Homebrew oder Flathub installieren? {#can-i-install-openscreen-with-winget-homebrew-or-flathub}
 
 - **winget:** Ja, über die Store-Quelle: `winget install --source msstore OpenScreen`.
-- **Homebrew:** Ja, über den offiziellen Tap: `brew install --cask getopenscreen/openscreen/openscreen`. Jede stabile Version aktualisiert den Cask.
+- **Homebrew:** Ja: `brew install --cask openscreen` aus der Hauptliste von Homebrew, oder über den offiziellen Tap: `brew install --cask getopenscreen/openscreen/openscreen`. Beide folgen jeder stabilen Version. Der alte Tap `siddharthvaddem/openscreen` bleibt bei v1.5.0 stehen.
 - **Flathub:** Es gibt keinen Eintrag.
 
 ## Ist das das ursprüngliche OpenScreen-Projekt? {#is-this-the-original-openscreen-project}
@@ -88,7 +88,7 @@ Unter [Installation](./installation.md) stehen die Schritte für jede Plattform.
 
 - Siddharth Vaddem hat OpenScreen entwickelt und das [ursprüngliche Repository](https://github.com/siddharthvaddem/openscreen) nach v1.5.0 archiviert.
 - Die Entwicklung ist mit seiner Zustimmung nach [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen) umgezogen, unter demselben Namen und derselben MIT-Lizenz.
-- Die archivierte README nennt dieses Projekt einen Community-getragenen Ableger, geleitet von einem der Hauptbeitragenden. Das ist Etienne Lescot, der es pflegt. Der Link in der README, github.com/EtienneLescot/openscreen, leitet auf das aktuelle Repository weiter.
+- Die archivierte README verweist jetzt auf dieses Repository. Etienne Lescot, einer der ursprünglichen Hauptbeitragenden, pflegt es.
 - Das archivierte Repository bekommt keine Updates mehr. [Picking up OpenScreen (auf Englisch)](/blog/2026/06/15/picking-up-openscreen/) erklärt die Übergabe.
 
 ## Hat OpenScreen etwas mit openscreen.io oder openscreen.net zu tun? {#is-openscreen-related-to-openscreenio-or-openscreennet}

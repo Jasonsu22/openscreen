@@ -42,7 +42,7 @@ const noop = () => {};
 
 function renderTopBar(
 	projectTitle: string | null,
-	history: { canUndo?: boolean; canRedo?: boolean } = {},
+	state: { canUndo?: boolean; canRedo?: boolean; dirty?: boolean } = {},
 ) {
 	const onRename = vi.fn();
 	const onShowAbout = vi.fn();
@@ -60,10 +60,10 @@ function renderTopBar(
 				mode="edit"
 				onModeChange={noop}
 				projectTitle={projectTitle}
-				dirty={false}
+				dirty={state.dirty ?? false}
 				canExport={false}
-				canUndo={history.canUndo ?? false}
-				canRedo={history.canRedo ?? false}
+				canUndo={state.canUndo ?? false}
+				canRedo={state.canRedo ?? false}
 				chatOpen={false}
 				actions={{
 					openProject: onOpenProject,
@@ -241,6 +241,20 @@ describe("AppMenu", () => {
 		expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 	});
 
+	it("saves diagnostics through main, the editor having no menu bar on Windows and Linux", () => {
+		const saveDiagnostics = vi.fn(() => Promise.resolve());
+		(window as unknown as { electronAPI?: unknown }).electronAPI = { saveDiagnostics };
+		try {
+			renderTopBar("Demo Project");
+			fireEvent.click(screen.getByRole("button", { name: /OpenScreen/ }));
+			fireEvent.click(screen.getByRole("menuitem", { name: /actions\.saveDiagnostics/ }));
+			expect(saveDiagnostics).toHaveBeenCalledTimes(1);
+			expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+		} finally {
+			(window as unknown as { electronAPI?: unknown }).electronAPI = undefined;
+		}
+	});
+
 	it("offers the repo permanently and routes it through main, on every channel", async () => {
 		// The counterpart to the one-time ask after an export: this row is always there. It is
 		// deliberately NOT behind the update veto — a link to the repo root is the one thing a
@@ -391,11 +405,17 @@ describe("EditorTopBar responsive affordances and tooltips", () => {
 		for (const tab of tabs) expect(tab).not.toHaveAttribute("title");
 	});
 
-	it("says the saved state beside the project name, to the eye and to a screen reader", () => {
-		renderTopBar("Demo Project");
-		const savedIndicator = screen.getByTitle("topbar.saved");
-		expect(savedIndicator).toBeInTheDocument();
-		expect(savedIndicator).toHaveTextContent("topbar.saved");
+	it.each([
+		false,
+		true,
+	])("shows the save state in a tooltip and to screen readers (dirty=%s)", async (dirty) => {
+		renderTopBar("Demo Project", { dirty });
+		const label = dirty ? "topbar.unsaved" : "topbar.saved";
+		const savedIndicator = screen.getByText(label).parentElement;
+		expect(savedIndicator).not.toHaveAttribute("title");
+		expect(savedIndicator).toHaveTextContent(label);
+		fireEvent.pointerMove(savedIndicator as HTMLElement);
+		await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(label));
 	});
 
 	it("steps through history from the bar, and says when there is nothing to step to", () => {
@@ -493,6 +513,11 @@ describe("AppMenu sizing (issue #969)", () => {
 		return body ?? "";
 	};
 
+	it("lets the save status receive real pointer events inside the titlebar", () => {
+		expect(rule("saveDot")).toMatch(/-webkit-app-region:\s*no-drag/);
+		expect(rule("saveDot")).toMatch(/(^|\s)app-region:\s*no-drag/);
+	});
+
 	it("sizes the menu to its widest row", () => {
 		expect(rule("appMenu")).toMatch(/^\s*width:\s*max-content;/m);
 	});
@@ -530,5 +555,67 @@ describe("top bar drag region while a menu is open (issue #1009)", () => {
 		fireEvent.mouseDown(bar);
 		expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 		expect(bar.matches(condition)).toBe(false);
+	});
+});
+
+describe("the update button", () => {
+	function stubUpdateBadge(initial: { state: "available" | "ready"; version: string } | null) {
+		let push: ((badge: typeof initial) => void) | null = null;
+		const applyUpdate = vi.fn(() => Promise.resolve());
+		(window as unknown as { electronAPI?: unknown }).electronAPI = {
+			getAppInfo: () => Promise.resolve({ version: "2.1.2", canCheckForUpdates: true }),
+			canCheckForUpdatesNow: () => Promise.resolve(true),
+			getUpdateBadge: () => Promise.resolve(initial),
+			onUpdateBadgeChanged: (callback: (badge: typeof initial) => void) => {
+				push = callback;
+				return () => {
+					push = null;
+				};
+			},
+			applyUpdate,
+		};
+		return {
+			applyUpdate,
+			push: (badge: typeof initial) => act(() => push?.(badge)),
+			restore: () => {
+				(window as unknown as { electronAPI?: unknown }).electronAPI = undefined;
+			},
+		};
+	}
+
+	it("stays out of the bar while no update waits", async () => {
+		const stub = stubUpdateBadge(null);
+		try {
+			renderTopBar("Demo Project");
+			await act(() => Promise.resolve());
+			expect(screen.queryByRole("button", { name: /actions\.updateTo/ })).not.toBeInTheDocument();
+		} finally {
+			stub.restore();
+		}
+	});
+
+	it("appears once the main process has one ready, and hands the click back to it", async () => {
+		const stub = stubUpdateBadge({ state: "ready", version: "2.2.0" });
+		try {
+			renderTopBar("Demo Project");
+			fireEvent.click(await screen.findByRole("button", { name: /actions\.updateTo/ }));
+			expect(stub.applyUpdate).toHaveBeenCalledTimes(1);
+		} finally {
+			stub.restore();
+		}
+	});
+
+	it("follows a badge the background check pushes after the bar mounted", async () => {
+		const stub = stubUpdateBadge(null);
+		try {
+			renderTopBar("Demo Project");
+			await act(() => Promise.resolve());
+			stub.push({ state: "available", version: "2.2.0" });
+			expect(screen.getByRole("button", { name: /actions\.updateTo/ })).toBeInTheDocument();
+			stub.push(null);
+			expect(screen.queryByRole("button", { name: /actions\.updateTo/ })).not.toBeInTheDocument();
+		} finally {
+			stub.restore();
+		}
 	});
 });

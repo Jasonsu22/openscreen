@@ -19,10 +19,45 @@
 // rules can be tested without an Electron runtime.
 
 import {
+	HUD_EDGE_SLACK,
+	HUD_MODAL_MAX_HEIGHT,
+	HUD_MODAL_MIN_HEIGHT,
+	HUD_POPOVER_GAP,
+	HUD_TOOLTIP_STACK_HEIGHT,
+} from "../src/components/launch/hudGeometry";
+import {
 	clampRectToWorkArea,
 	type DisplayWorkArea,
 	type EditorWindowRect,
 } from "./editorWindowState";
+
+/** The Notes window's opening height, and the least it can be resized to. */
+export const NOTES_WINDOW_HEIGHT = 540;
+export const NOTES_WINDOW_MIN_HEIGHT = 400;
+
+/**
+ * Where the bar's top sits in the Wayland HUD window, from the window's top edge: the window
+ * keeps the tallest panel's room above the bar (`computeHudLinuxStack`), so this is that room
+ * plus the edge slack. Measured 503px on a 1080p GNOME desktop.
+ */
+export const WAYLAND_HUD_BAR_TOP = HUD_EDGE_SLACK + HUD_POPOVER_GAP + HUD_MODAL_MAX_HEIGHT;
+
+/** Below this Notes is too short to read from: a screen with less room above the bar gets the bar covered. */
+export const NOTES_WINDOW_FLOOR_HEIGHT = HUD_MODAL_MIN_HEIGHT;
+
+/**
+ * The height Notes settles at. On Wayland, Notes opens at the work area's top edge, which the
+ * HUD's window cannot rise above (notesPlacement.ts), so the HUD's visible stack is at least
+ * `stackTop` below Notes' top: the stack's top in the HUD window, as the renderer last reported
+ * it. The room above the bar shrinks on a short screen or with the tall vertical bar, so the
+ * reported top is used when there is one, and the full reserve's otherwise. Notes stops short of
+ * the room the bar's tooltips take above it, so it covers neither; the user can make it taller.
+ */
+export function notesWindowHeight(wayland: boolean, stackTop: number | null = null): number {
+	if (!wayland) return NOTES_WINDOW_HEIGHT;
+	const clearOfBar = (stackTop ?? WAYLAND_HUD_BAR_TOP) - HUD_TOOLTIP_STACK_HEIGHT;
+	return Math.floor(Math.max(NOTES_WINDOW_FLOOR_HEIGHT, Math.min(NOTES_WINDOW_HEIGHT, clearOfBar)));
+}
 
 /** The HUD's own floor, matching `minWidth`/`minHeight` at construction. */
 export const HUD_WINDOW_MIN = { width: 120, height: 80 };

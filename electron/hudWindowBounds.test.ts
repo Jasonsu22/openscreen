@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
+import { HUD_TOOLTIP_STACK_HEIGHT } from "../src/components/launch/hudGeometry";
 import {
 	clampHudBoundsToWorkArea,
 	clampHudContentToWorkArea,
 	hudBarAnchor,
 	hudDragDestination,
 	hudResizeBounds,
+	NOTES_WINDOW_FLOOR_HEIGHT,
+	NOTES_WINDOW_HEIGHT,
+	notesWindowHeight,
 	parseHudContentRect,
+	WAYLAND_HUD_BAR_TOP,
 } from "./hudWindowBounds";
 
 // 1920x1080 with a 48px taskbar at the bottom: the work area stops above it.
@@ -300,5 +305,31 @@ describe("hud content rect parsing", () => {
 		expect(parseHudContentRect({ x: 0, y: 0, width: Number.NaN, height: 64 })).toBeNull();
 		expect(parseHudContentRect({ x: 0, y: 0, width: 0, height: 64 })).toBeNull();
 		expect(parseHudContentRect({ x: 0, y: 0, width: 560 })).toBeNull();
+	});
+});
+
+describe("Notes opening height (GNOME Wayland)", () => {
+	it("keeps its height where the app places its own windows", () => {
+		expect(notesWindowHeight(false)).toBe(NOTES_WINDOW_HEIGHT);
+	});
+
+	it("ends above the HUD bar and its tooltips when both start at the work area's top edge", () => {
+		// Notes opens at the top edge (notesPlacement.ts); the HUD's top is at that edge or below.
+		expect(notesWindowHeight(true) + HUD_TOOLTIP_STACK_HEIGHT).toBeLessThanOrEqual(
+			WAYLAND_HUD_BAR_TOP,
+		);
+		// What it replaces: at 540px Notes reached into the bar even from the same corner.
+		expect(NOTES_WINDOW_HEIGHT).toBeGreaterThan(WAYLAND_HUD_BAR_TOP);
+	});
+
+	it("follows the bar when the HUD reports less room above it", () => {
+		// A 600px screen leaves the bar 374px below the HUD's top (CodeRabbit on #1586).
+		expect(notesWindowHeight(true, 374)).toBe(374 - HUD_TOOLTIP_STACK_HEIGHT);
+		expect(notesWindowHeight(true, 900)).toBe(NOTES_WINDOW_HEIGHT);
+		expect(notesWindowHeight(true, 503.6)).toBe(417);
+	});
+
+	it("stops at a readable floor on a screen too short for it", () => {
+		expect(notesWindowHeight(true, 120)).toBe(NOTES_WINDOW_FLOOR_HEIGHT);
 	});
 });

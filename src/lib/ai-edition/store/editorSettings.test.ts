@@ -39,6 +39,29 @@ const baseDoc: AxcutDocument = {
 };
 
 describe("getEditorSettings", () => {
+	it("preserves the historical camera shadow by default and round-trips an independent strength", () => {
+		expect(getEditorSettings(baseDoc).webcamShadowIntensity).toBe(0.6);
+		for (const strength of [0, 0.3, 0.6, 0.9]) {
+			const saved = patchEditorSettings(baseDoc, {
+				webcamShadowIntensity: strength,
+				shadowIntensity: 0.3,
+			});
+			const reopened = getEditorSettings(JSON.parse(JSON.stringify(saved)));
+			expect(reopened.webcamShadowIntensity).toBe(strength);
+			expect(reopened.shadowIntensity).toBe(0.3);
+		}
+	});
+	it.each([
+		[-1, 0],
+		[5, 1],
+		["invalid", 0.6],
+		[null, 0.6],
+	])("bounds camera shadow %s as %s", (value, expected) => {
+		expect(
+			getEditorSettings({ ...baseDoc, legacyEditor: { webcamShadowIntensity: value } })
+				.webcamShadowIntensity,
+		).toBe(expected);
+	});
 	it("returns the defaults when the document has no legacyEditor", () => {
 		const snap = getEditorSettings(baseDoc);
 		expect(snap.wallpaper).toBe(DEFAULT_EDITOR_SETTINGS.wallpaper);
@@ -147,6 +170,15 @@ describe("getEditorSettings", () => {
 });
 
 describe("patchEditorSettings", () => {
+	it("persists the recording mute, off by default (#1104)", () => {
+		expect(getEditorSettings(baseDoc).recordingMuted).toBe(false);
+		const saved = patchEditorSettings(baseDoc, { recordingMuted: true });
+		expect(getEditorSettings(JSON.parse(JSON.stringify(saved))).recordingMuted).toBe(true);
+		expect(
+			getEditorSettings({ ...baseDoc, legacyEditor: { recordingMuted: "yes" } }).recordingMuted,
+		).toBe(false);
+	});
+
 	it("writes a single field and leaves others intact", () => {
 		const next = patchEditorSettings(baseDoc, { backgroundBlur: 0.5 });
 		const snap = getEditorSettings(next);

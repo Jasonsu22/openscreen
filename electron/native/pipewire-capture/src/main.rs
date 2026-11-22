@@ -36,12 +36,13 @@ mod ffmpeg;
 mod input;
 mod portal;
 mod shim;
+mod x11;
 
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -117,6 +118,9 @@ const MAX_CONSECUTIVE_IMPORT_FAILURES: u32 = 60;
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Request {
+    /// Explicit source chosen by the app on X11. Wayland ignores this and
+    /// continues to obtain its source exclusively through the portal.
+    source: Option<x11::Source>,
     sample_interval_ms: Option<u64>,
     /// Where to write the MP4. Absent means cursor-only: no pixels are mapped,
     /// no encoder is opened, and the helper behaves exactly as Stage 1 did.
@@ -278,6 +282,30 @@ fn main() {
         None => sample_interval,
     };
 
+    // The portal first: it is what gives dmabuf frames and GPU encoding. Direct
+    // X11 capture is only for an X11 session where nothing answers on the
+    // ScreenCast interface (Xfce, i3...). Probed before `shim::load` because an
+    // X11 desktop without a portal often has no PipeWire either.
+    let offered_cursor_modes = pollster::block_on(portal::offered_cursor_modes());
+    // A source means the app already chose X11, and the take follows it even if a
+    // portal has appeared since. Otherwise only a portal that is missing, or that
+    // refuses every session (#1491), falls back: one that fails later keeps its
+    // error. So does a version 1 portal, which offers no cursor modes (#1537):
+    // direct X11 reports the cursor, that portal cannot.
+    if x11::is_x11_session()
+        && (request.source.is_some()
+            || match &offered_cursor_modes {
+                Ok(modes) if modes.is_empty() => true,
+                Ok(_) => pollster::block_on(portal::refuses_sessions()),
+                Err(error) => matches!(error, portal::PortalError::Unavailable(_)),
+            })
+    {
+        if let Err(message) = x11::run(&request, &mut emitter) {
+            fail(&mut emitter, "x11-capture-failed", &message);
+        }
+        return;
+    }
+
     if let Err(message) = shim::load() {
         fail(&mut emitter, "pipewire-unavailable", &message);
     }
@@ -286,7 +314,7 @@ fn main() {
     // compositor fails immediately instead of after a pointless picker. Only
     // fatal when METADATA is the mode actually requested — a recording that
     // wants the system cursor painted in has no use for it.
-    let offered_cursor_modes = match pollster::block_on(portal::offered_cursor_modes()) {
+    let offered_cursor_modes = match offered_cursor_modes {
         Ok(modes) => modes,
         Err(error) => fail(&mut emitter, error.code(), &error.message()),
     };
@@ -304,6 +332,7 @@ fn main() {
         pipewire_version: shim::library_version(),
         cursor_metadata_supported,
         cursor_mode: cursor_mode.as_str(),
+        backend: "pipewire",
     });
 
     if request.probe_only {
@@ -554,20 +583,19 @@ fn begin_stream<W: Write>(
     granted_kind: &mut Option<portal::SourceKind>,
     stream: portal::PortalStream,
     prefer_dmabuf: bool,
+    shared_memory_only: bool,
     shared_memory_fallback: &mut Option<SharedMemoryFallback>,
 ) -> Result<(), ()> {
     let portal::PortalStream { fd, fallback_fd, node_id, position, size, source_kind } = stream;
-    *shared_memory_fallback = if prefer_dmabuf {
-        fallback_fd.map(|fd| SharedMemoryFallback {
-            fd,
-            node_id,
-            position,
-            size,
-            source_kind,
-        })
-    } else {
-        None
-    };
+    // Armed even without `prefer_dmabuf`: the DMA-BUF object is still offered in
+    // second place, and xdg-desktop-portal-cosmic picks it there too (issue #1445).
+    *shared_memory_fallback = fallback_fd.map(|fd| SharedMemoryFallback {
+        fd,
+        node_id,
+        position,
+        size,
+        source_kind,
+    });
     let forward = sender.clone();
     match shim::Session::start(
         fd,
@@ -577,6 +605,7 @@ fn begin_stream<W: Write>(
         }),
         frames.clone(),
         prefer_dmabuf,
+        shared_memory_only,
     ) {
         Ok(started) => {
             *session = Some(started);
@@ -629,6 +658,74 @@ fn should_retry_shared_memory(
         && error.is_some_and(|message| message.contains("alloc buffers"))
 }
 
+/// niri on the NVIDIA driver negotiates DMA-BUF, then marks every chunk
+/// corrupted with size 0 (issue #1503), so no frame ever reaches the encoder.
+/// Under the shim's five drop reports per stream, so the count is reached.
+const CORRUPTED_FRAMES_BEFORE_RETRY: u32 = 3;
+
+fn is_corrupted_dmabuf_frame(code: &str, detail: &str) -> bool {
+    code == "frame-dropped"
+        && detail.contains("(producer-marked-frame-corrupted)")
+        && detail.contains("dataType=DmaBuf")
+}
+
+/// Drops the failed stream and reconnects with the portal's independent
+/// remote, offering the shm format alone; that attempt arms no further retry.
+#[allow(clippy::too_many_arguments)]
+fn retry_on_shared_memory<W: Write>(
+    emitter: &mut Emitter<W>,
+    receiver: &Receiver<Message>,
+    sender: &Sender<Message>,
+    frames: &Option<Arc<shim::FrameMailbox>>,
+    session: &mut Option<shim::Session>,
+    portal_stream: &mut Option<StreamInfo>,
+    granted_kind: &mut Option<portal::SourceKind>,
+    fallback: SharedMemoryFallback,
+    shared_memory_fallback: &mut Option<SharedMemoryFallback>,
+    reason: &str,
+) -> Result<(), ()> {
+    // Joined before reconnecting, so everything the old stream sent is queued.
+    // Its events are dropped, or a late error would end the new stream; the
+    // rest goes back on the channel.
+    drop(session.take());
+    // A frame still in the mailbox, and the buffers queued for return, belong
+    // to the stream just dropped: neither may reach the new one.
+    if let Some(mailbox) = frames.as_ref() {
+        let _ = mailbox.take();
+        let _ = mailbox.drain_requeue();
+    }
+    for message in receiver.try_iter().collect::<Vec<_>>() {
+        if !matches!(message, Message::Stream(_)) {
+            let _ = sender.send(message);
+        }
+    }
+    *portal_stream = None;
+    let _ = emitter.emit(&Event::Warning {
+        code: "capture-retry-shared-memory".to_owned(),
+        message: reason.to_owned(),
+    });
+    let retry = portal::PortalStream {
+        fd: fallback.fd,
+        fallback_fd: None,
+        node_id: fallback.node_id,
+        position: fallback.position,
+        size: fallback.size,
+        source_kind: fallback.source_kind,
+    };
+    begin_stream(
+        emitter,
+        sender,
+        frames,
+        session,
+        portal_stream,
+        granted_kind,
+        retry,
+        false,
+        true,
+        shared_memory_fallback,
+    )
+}
+
 /// A stream error ends the helper only before capture has started, or the app
 /// waits on a recording that never starts. "Started" is the first staged frame
 /// in video mode, and `streaming` in cursor-only mode, which has no `Capture`.
@@ -668,6 +765,8 @@ fn run<W: Write>(
     // Retain the portal grant while the preferred DMA-BUF format is starting,
     // so a buffer-allocation failure can retry shared-memory-first once.
     let mut shared_memory_fallback: Option<SharedMemoryFallback> = None;
+    // DMA-BUF frames the producer marked corrupted before any usable one.
+    let mut corrupted_frames = 0;
     // `record` has been received. Latched, because it can arrive before the
     // picker has been answered.
     let mut armed = false;
@@ -713,7 +812,7 @@ fn run<W: Write>(
     // has settled by the time the first video frame arrives. Everything they
     // record before that first frame is discarded — see `Capture::stage`.
     // `_audio_sessions` is bound, not dropped: dropping one stops its thread.
-    let (_audio_sessions, mut audio_sources) = start_audio(emitter, &config.audio);
+    let (_audio_sessions, audio_sources) = start_audio(emitter, &config.audio);
     // Buffered until the format is negotiated: the encoder cannot be opened
     // before the frame size is known, and `pause` can arrive first.
     let mut paused = false;
@@ -910,7 +1009,9 @@ fn run<W: Write>(
                                 config.fps,
                                 config.bitrate,
                                 config.forced_encoder,
-                                std::mem::take(&mut audio_sources),
+                                // Cloned, not taken: an unstarted capture is rebuilt
+                                // when the stream falls back to shared memory.
+                                audio_sources.clone(),
                                 frame.dmabuf.as_ref(),
                             ) {
                                 Ok((started, selection)) => {
@@ -943,6 +1044,7 @@ fn run<W: Write>(
                     let Some(capture) = capture.as_mut() else {
                         // Cursor-only session: no encoder, nothing to stage. The
                         // recycle below still has to run.
+                        shared_memory_fallback = None;
                         mailbox.recycle(frame.pixels);
                         continue;
                     };
@@ -1014,6 +1116,9 @@ fn run<W: Write>(
                     // Only once a frame has actually staged — a first frame that
                     // dropped leaves capture unstarted, so this waits for a real one.
                     if first && capture.started() {
+                        // A frame staged: the corrupted-frame retry is moot. Not
+                        // earlier, as a first frame can still fail its GPU import.
+                        shared_memory_fallback = None;
                         let _ = emitter.emit(&Event::CaptureStarted {
                             timestamp_ms: timestamp_ms(),
                             path: config
@@ -1056,6 +1161,7 @@ fn run<W: Write>(
                         &mut granted_kind,
                         stream,
                         prefer_dmabuf,
+                        false,
                         &mut shared_memory_fallback,
                     ) {
                         exit_code = 1;
@@ -1117,6 +1223,7 @@ fn run<W: Write>(
                         &mut granted_kind,
                         stream,
                         prefer_dmabuf,
+                        false,
                         &mut shared_memory_fallback,
                     ) {
                         exit_code = 1;
@@ -1224,10 +1331,52 @@ fn run<W: Write>(
             // Without this the only honest symptom is a file with no frames in
             // it and nothing anywhere saying why.
             Ok(Message::Stream(StreamEvent::CaptureIssue { code, detail })) => {
+                let corrupted = is_corrupted_dmabuf_frame(&code, &detail);
                 let _ = emitter.emit(&Event::Warning {
                     code,
                     message: detail,
                 });
+                if corrupted && shared_memory_fallback.is_some() {
+                    corrupted_frames += 1;
+                    if corrupted_frames >= CORRUPTED_FRAMES_BEFORE_RETRY {
+                        let fallback = shared_memory_fallback.take().expect("checked above");
+                        // Nothing of the retired stream carries over: a frame
+                        // held for its crop, its crop wait, its streaming edge
+                        // (the click gate), and an encoder that one of its
+                        // frames opened but never started, which may be bound to
+                        // the DMA-BUF importer the shm stream cannot feed.
+                        if let Some(held) = held_frame.take() {
+                            if let Some(mailbox) = frames.as_ref() {
+                                mailbox.recycle(held.pixels);
+                            }
+                        }
+                        crop_wait_since = None;
+                        streaming_since = None;
+                        // Its audio rings outlive it through `audio_sources`. A
+                        // pause closed them; reopen them before it goes, or a
+                        // Resume that lands before the replacement opens has no
+                        // capture to resume and the new one records no audio.
+                        // The replacement re-pauses them if `paused` still holds.
+                        if let Some(mut retired) = capture.take() {
+                            retired.resume();
+                        }
+                        if let Err(()) = retry_on_shared_memory(
+                            emitter,
+                            &receiver,
+                            &sender,
+                            &frames,
+                            &mut session,
+                            &mut portal_stream,
+                            &mut granted_kind,
+                            fallback,
+                            &mut shared_memory_fallback,
+                            "The compositor marks every DMA-BUF frame corrupted; retrying screen capture with shared-memory buffers.",
+                        ) {
+                            exit_code = 1;
+                            break;
+                        }
+                    }
+                }
             }
 
             Ok(Message::Stream(StreamEvent::State { state, error })) => {
@@ -1252,9 +1401,12 @@ fn run<W: Write>(
                     if streaming_since.is_none() {
                         streaming_since = Some(timestamp_ms());
                     }
-                    // No retry is appropriate after the compositor accepted
-                    // the stream; release the extra portal fd immediately.
-                    shared_memory_fallback = None;
+                    // No allocation retry is appropriate after the compositor
+                    // accepted the stream. A video session keeps the grant until
+                    // its first frame, for the corrupted-frame retry (#1503).
+                    if frames.is_none() {
+                        shared_memory_fallback = None;
+                    }
                 } else if state == "unconnected" {
                     streaming_since = None;
                 }
@@ -1267,41 +1419,21 @@ fn run<W: Write>(
                     shared_memory_fallback.is_some(),
                 ) {
                     let fallback = shared_memory_fallback.take().expect("checked above");
-                    // Drop and join the failed stream before reconnecting with
-                    // the portal's independent remote. The second attempt
-                    // prefers shared memory; it will not arm another retry.
-                    drop(session.take());
-                    portal_stream = None;
-                    let _ = emitter.emit(&Event::Warning {
-                        code: "capture-retry-shared-memory".to_owned(),
-                        message: "PipeWire buffer allocation failed with DMA-BUF; retrying screen capture with shared-memory buffers."
-                            .to_owned(),
-                    });
-                    let retry = portal::PortalStream {
-                        fd: fallback.fd,
-                        fallback_fd: None,
-                        node_id: fallback.node_id,
-                        position: fallback.position,
-                        size: fallback.size,
-                        source_kind: fallback.source_kind,
-                    };
-                    if let Err(()) = begin_stream(
+                    if let Err(()) = retry_on_shared_memory(
                         emitter,
+                        &receiver,
                         &sender,
                         &frames,
                         &mut session,
                         &mut portal_stream,
                         &mut granted_kind,
-                        retry,
-                        false,
+                        fallback,
                         &mut shared_memory_fallback,
+                        "PipeWire buffer allocation failed; retrying screen capture with shared-memory buffers.",
                     ) {
                         exit_code = 1;
                         break;
                     }
-                    // `begin_stream` already replaced the session and info;
-                    // any queued messages from the old stream precede events
-                    // from this new PipeWire thread.
                     continue;
                 }
                 if let Some(error) = error {
@@ -1875,7 +2007,8 @@ mod microphone_resolution_tests {
 #[cfg(test)]
 mod capture_fallback_tests {
     use super::{
-        holds_for_crop, should_retry_shared_memory, stream_error_is_fatal, MAX_CROP_WAIT,
+        holds_for_crop, is_corrupted_dmabuf_frame, should_retry_shared_memory,
+        stream_error_is_fatal, MAX_CROP_WAIT,
     };
     use std::time::Duration;
 
@@ -1928,6 +2061,24 @@ mod capture_fallback_tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn a_corrupted_dmabuf_frame_counts_toward_the_shared_memory_retry() {
+        // The shim's report for niri on NVIDIA (issue #1503).
+        let corrupted = |data_type: &str| {
+            format!(
+                "the compositor's buffer failed validation (producer-marked-frame-corrupted),                  so this frame was dropped: dataType={data_type} stride=10240 width=2560                  height=1080 chunkOffset=0 chunkSize=0 available=11059200"
+            )
+        };
+        assert!(is_corrupted_dmabuf_frame("frame-dropped", &corrupted("DmaBuf")));
+        // Shared memory already is the fallback.
+        assert!(!is_corrupted_dmabuf_frame("frame-dropped", &corrupted("MemFd")));
+        assert!(!is_corrupted_dmabuf_frame(
+            "frame-dropped",
+            "the compositor's buffer failed validation (stride-shorter-than-row), so this              frame was dropped: dataType=DmaBuf",
+        ));
+        assert!(!is_corrupted_dmabuf_frame("dmabuf-import-failed", &corrupted("DmaBuf")));
     }
 
     #[test]

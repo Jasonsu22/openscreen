@@ -351,7 +351,12 @@
 		"done": "완료",
 		"ratio": "비율",
 		"cropVideo": "비디오 자르기",
-		"lockAspectRatio": "화면 비율 고정"
+		"lockAspectRatio": "화면 비율 고정",
+		"x": "X (px)",
+		"y": "Y (px)",
+		"width": "너비 (px)",
+		"height": "높이 (px)",
+		"position": "자르기 위치와 크기(픽셀)"
 	},
 	"zoom": {
 		"position": {
@@ -388,6 +393,7 @@
 	},
 	"audio": {
 		"outputGain": "출력 레벨",
+		"muteRecording": "녹화 오디오 음소거",
 		"help": "음성은 표준 라우드니스로 자동 조정됩니다. 거기서부터 출력 레벨을 조정하세요. 미리보기와 내보내기에 동일하게 적용됩니다.",
 		"reset": "오디오 재설정",
 		"title": "오디오"

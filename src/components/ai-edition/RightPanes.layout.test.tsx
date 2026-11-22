@@ -366,6 +366,29 @@ describe("LayoutPane picture-in-picture camera", () => {
 		expect(stored()).toMatchObject({ webcamAnchor: "top-left" });
 	});
 
+	it("changes the camera shadow independently of composition shadow", () => {
+		renderLayout(seedProject(true));
+		const shadow = screen.getByRole("group", { name: "Shadow" });
+		expect(within(shadow).getByRole("button", { name: "Medium" })).toHaveAttribute(
+			"aria-pressed",
+			"true",
+		);
+		fireEvent.click(within(shadow).getByRole("button", { name: "None" }));
+		expect(stored()).toMatchObject({ webcamShadowIntensity: 0 });
+		fireEvent.click(within(shadow).getByRole("button", { name: "Strong" }));
+		expect(stored()).toMatchObject({ webcamShadowIntensity: 0.9 });
+	});
+
+	// A cutout camera has no bubble to cast a shadow, so the setting is hidden, not disabled.
+	it("hides the camera shadow in cutout mode", () => {
+		const doc = seedProject(true);
+		renderLayout({
+			...doc,
+			legacyEditor: { ...doc.legacyEditor, webcamBackgroundMode: "transparent" },
+		});
+		expect(screen.queryByRole("group", { name: "Shadow" })).toBeNull();
+	});
+
 	// The middle of the frame is a hole in the grid, not a ninth place to land.
 	it("steps over the middle of the grid with the arrow keys", () => {
 		renderLayout(seedProject(true));

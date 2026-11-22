@@ -196,6 +196,7 @@
 		"exportFailedGeneric": "匯出失敗。",
 		"writingFile": "正在寫入檔案…",
 		"renderingFrames": "正在轉譯畫格",
+		"renderingGif": "正在匯出 GIF",
 		"framesEta": "{{current}} / {{total}} 畫格 · 預計剩餘 {{eta}} 秒",
 		"preparingEncoder": "正在準備編碼器…",
 		"close": "關閉",
@@ -322,7 +323,24 @@
 		"stop": "停止",
 		"stopping": "正在停止…",
 		"stopped": "你已停止本輪執行。已套用的編輯已保留。",
-		"stopFailed": "無法停止 Agent 本輪執行。"
+		"stopFailed": "無法停止 Agent 本輪執行。",
+		"usageComplete": "{{tokens}} 個 token",
+		"usagePartial": "已知 {{tokens}} 個 token · 不完整",
+		"usageUnavailable": "Token 用量無法取得",
+		"usageCoverage": "已統計 {{counted}} / {{calls}} 次模型呼叫",
+		"usageInput": "輸入：{{tokens}}",
+		"usageOutput": "輸出：{{tokens}}",
+		"usageCachedInput": "已回報的快取輸入：{{tokens}}",
+		"usageCacheCreation": "已回報的快取建立輸入：{{tokens}}",
+		"usageReasoning": "已回報的推理輸出：{{tokens}}",
+		"executionSteps": "執行步驟",
+		"stepStatus": {
+			"running": "執行中",
+			"succeeded": "成功",
+			"failed": "失敗",
+			"stopped": "已停止"
+		},
+		"stepReasoning": "推理"
 	},
 	"newProjectDialog": {
 		"title": "新增專案",
@@ -346,7 +364,15 @@
 		"openHint": "開啟",
 		"browseFiles": "瀏覽檔案…",
 		"deleteProject": "刪除專案",
-		"confirmDelete": "刪除此專案？您的錄影檔案會保留。"
+		"confirmDelete": "刪除此專案？您的錄影檔案會保留。",
+		"confirmDeleteProject": "要刪除此專案嗎？",
+		"alsoTrash": "同時將其錄製檔案移到垃圾桶（{{size}}）",
+		"alsoRecycle": "同時將其錄製檔案移到資源回收筒（{{size}}）",
+		"recordingsKeptFor": "{{projects}} 使用的錄製檔案會保留。",
+		"recordingsKeptUnreadable": "部分專案無法讀取，因此會保留此專案的錄製檔案。",
+		"trashFailed": "無法將錄製檔案移到垃圾桶。要永久刪除嗎？",
+		"recycleFailed": "無法將錄製檔案移到資源回收筒。要永久刪除嗎？",
+		"deletePermanently": "永久刪除"
 	},
 	"editClipDialog": {
 		"title": "編輯片段",
@@ -357,6 +383,10 @@
 		"duration": "最終時長",
 		"reset": "重設",
 		"apply": "套用",
+		"rotation": "旋轉",
+		"rotationUpright": "0°",
+		"rotationTurned": "180°",
+		"rotationTip": "將畫面上下顛倒，例如用於倒裝的攝影機",
 		"pickClipTitle": "選擇要編輯的片段",
 		"clipLabel": "片段 {{index}}"
 	},

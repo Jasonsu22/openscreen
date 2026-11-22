@@ -630,9 +630,18 @@ impl Decoder {
         }
     }
 
-    /// Durée réellement annoncée par le flux vidéo (symétrique de
-    /// `pipeline_windows::Decoder::available_duration_sec`).
+    /// Durée disponible de la source : le plus long du flux vidéo et du conteneur (cf.
+    /// `cover_container_duration`). Symétrique de
+    /// `pipeline_windows::Decoder::available_duration_sec`.
     pub unsafe fn available_duration_sec(&self) -> Option<f64> {
+        crate::timeline_walk::cover_container_duration(
+            self.video_stream_duration_sec(),
+            crate::ffi::sn_fmt_duration(self.fmt),
+        )
+    }
+
+    /// Durée annoncée par le seul flux vidéo, `nb_frames / fps` en repli.
+    unsafe fn video_stream_duration_sec(&self) -> Option<f64> {
         let stream = crate::ffi::sn_fmt_stream(self.fmt, self.vidx);
         let duration = (*stream).duration;
         let tb_sec = self.tb_sec();
@@ -943,6 +952,8 @@ impl VideoEncoder {
         (*ctx).framerate = crate::ffi::AVRational { num: fps, den: 1 };
         (*ctx).bit_rate = bit_rate;
         (*ctx).flags |= crate::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+        // `rgb2y` / `rgb2uv` de `shaders.metal` : BT.709 limité.
+        crate::ffi::tag_export_color(ctx, crate::ffi::AVColorSpace::AVCOL_SPC_BT709);
 
         // VT : on attache le hw_frames_ctx. En pratique le call-site (run_composited_multi)
         // nous passera un `hw_frames_ctx` pré-construit lié au même device VideoToolbox
@@ -1474,6 +1485,13 @@ unsafe fn drain_encoder(
             return Ok(());
         }
         averr(r, "receive_packet")?;
+        // VideoToolbox hands its packets back without a duration. The MP4 muxer then gives the
+        // last sample none and ends the edit list on its pts, and a player drops that frame
+        // whenever its pts falls on a whole millisecond (every third frame index): a 30 fps
+        // export of 277 frames played 276. The time base is 1/fps, so one tick is one frame.
+        if (*opkt).duration <= 0 {
+            (*opkt).duration = 1;
+        }
         av_packet_rescale_ts(opkt, (*ectx).time_base, (*ostream).time_base);
         averr(
             av_interleaved_write_frame(octx, opkt),

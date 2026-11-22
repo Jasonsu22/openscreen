@@ -300,6 +300,7 @@ jobs:
     # ffmpeg's configure, cargo and the output paths — four blind changes on a release
     # branch, none of them testable without a Mac.
     runs-on: ${{ matrix.arch == 'x64' && 'macos-15-intel' || 'macos-latest' }}
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -430,6 +431,11 @@ jobs:
           restore-keys: |
             cargo-macos-${{ matrix.arch }}-
 
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}-apple-darwin
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Build Metal compositor addon
         run: npm run build:native:compositor:mac
 
@@ -497,6 +503,14 @@ jobs:
             echo "::error::The ${{ matrix.arch }} job produced a '${ACTUAL}' bundle — refusing to publish a mislabelled DMG"
             exit 1
           fi
+
+      # Without it the installed app can never update itself, and nothing else says so: the
+      # probe fails a minute after launch and falls back to the release page (#1431).
+      - name: Verify .app carries app-update.yml
+        run: |
+          FILE="${{ steps.find_app.outputs.app_bundle }}/Contents/Resources/app-update.yml"
+          [[ -f "$FILE" ]] || { echo "::error::${FILE} is missing — scripts/after-pack.cjs did not run"; exit 1; }
+          cat "$FILE"
 
       # electron-builder used to do this itself. Its macPackager carried a
       # `noIdentity && fallBackToAdhoc` branch that handed back `Identity("-")`
@@ -667,13 +681,29 @@ jobs:
 
       - name: Staple notarization ticket
         if: steps.signing.outputs.enabled == 'true'
-        run: xcrun stapler staple "${{ steps.dmg.outputs.dmg_path }}"
+        # Apple's ticket lookup drops the connection now and then (error 68); retry it.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            xcrun stapler staple "${{ steps.dmg.outputs.dmg_path }}" && exit 0
+            [ "$attempt" -eq 5 ] && break
+            echo "Staple attempt $attempt failed, retrying in 30 s"
+            sleep 30
+          done
+          exit 1
+        timeout-minutes: 10
 
       - name: Validate stapled DMG
         if: steps.signing.outputs.enabled == 'true'
+        # validate queries Apple too and fails the same way (error 68); retry it like staple.
         run: |
-          xcrun stapler validate "${{ steps.dmg.outputs.dmg_path }}"
+          for attempt in 1 2 3 4 5; do
+            xcrun stapler validate "${{ steps.dmg.outputs.dmg_path }}" && break
+            [ "$attempt" -eq 5 ] && exit 1
+            echo "Validate attempt $attempt failed, retrying in 30 s"
+            sleep 30
+          done
           spctl -a -vv -t install "${{ steps.dmg.outputs.dmg_path }}"
+        timeout-minutes: 10
 
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v7
@@ -854,6 +884,7 @@ jobs:
   publish-release:
     name: Publish GitHub release
     runs-on: ubuntu-latest
+    environment: release
     needs:
       - build-windows
       - build-macos
@@ -1175,6 +1206,7 @@ jobs:
   publish-msstore:
     name: Publish to Microsoft Store
     runs-on: windows-latest
+    environment: release
     # The workflow-wide token is `contents: write` because publish-release needs
     # it. This job only reads: it checks the tree out so the CLI can identify the
     # project, downloads a same-run artifact (which uses the runtime token, not

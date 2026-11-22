@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { app, BrowserWindow, ipcMain, screen } from "electron";
+import { cameraPreviewBounds, resizedCameraPreviewBounds } from "../src/lib/cameraPreview";
 import {
 	fitEditorRect,
 	loadEditorWindowState,
@@ -17,12 +18,15 @@ import {
 	hudContentScreenRect,
 	hudDragDestination,
 	hudResizeBounds,
+	NOTES_WINDOW_MIN_HEIGHT,
+	notesWindowHeight,
 	parseHudContentRect,
 	sameRect,
 } from "./hudWindowBounds";
 import { keepAlwaysOnTop, reassertAlwaysOnTop } from "./keepOnTop";
 import { followAcrossSpaces } from "./macSpaces";
 import { markSheetless } from "./messageBox";
+import { shrinkOncePlaced, topEdgeOpeningHeight } from "./notesPlacement";
 import { usesWaylandBackend } from "./wayland";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -165,6 +169,22 @@ function hudBounds(win: BrowserWindow): Electron.Rectangle {
 	return { x, y, ...hudWindowSize };
 }
 
+/**
+ * Applies size and position to a window created with `resizable: false` (the HUD, the camera
+ * preview). On Linux that flag is published to the window manager as fixed min/max hints,
+ * and Mutter then ignores the programmatic size change, so the hints are lifted around the
+ * call.
+ */
+function setUnresizableWindowBounds(win: BrowserWindow, next: Electron.Rectangle) {
+	if (process.platform === "linux") {
+		win.setResizable(true);
+		win.setBounds(next, false);
+		win.setResizable(false);
+	} else {
+		win.setBounds(next, false);
+	}
+}
+
 // Origin the current drag gesture started from. The renderer sends the pointer's
 // *total* travel since pointerdown rather than per-frame deltas, so every move is
 // an absolute `origin + delta` — no rounding to accumulate, and a dropped message
@@ -177,6 +197,9 @@ let hudDragOrigin: { x: number; y: number } | null = null;
 // reserve that may overhang any edge (see hudWindowBounds.ts). Null until the
 // renderer's first measurement.
 let hudContentRect: HudContentRect | null = null;
+// The same rect on every platform, Linux included, where positioning ignores it: Notes is
+// sized from it on Wayland (createNotesWindow).
+let hudStackRect: HudContentRect | null = null;
 
 // Where the user left the bar: its bottom-centre on screen, set by a drag and by the first
 // resize. A re-clamp places the bar from here, never from where the window was last pushed:
@@ -217,7 +240,7 @@ function reclampHud() {
 			})
 		: clampHudBoundsToWorkArea(bounds, hudContentRect, workArea);
 	if (!sameRect(next, bounds)) {
-		win.setBounds(next, false);
+		setUnresizableWindowBounds(win, next);
 	}
 }
 
@@ -416,7 +439,9 @@ ipcMain.on("hud-overlay-set-size", (_event, width: number, height: number, conte
 	}
 
 	const bounds = hudBounds(hudOverlayWindow);
-	const nextContent = HUD_CLAMPS_CONTENT ? parseHudContentRect(content) : null;
+	const parsed = parseHudContentRect(content);
+	hudStackRect = parsed ?? hudStackRect;
+	const nextContent = HUD_CLAMPS_CONTENT ? parsed : null;
 	hudBarHome ??= hudBarAnchor(bounds, hudContentRect);
 	const next = hudResizeBounds({
 		bounds,
@@ -435,7 +460,7 @@ ipcMain.on("hud-overlay-set-size", (_event, width: number, height: number, conte
 	hudWindowSize = { width: next.width, height: next.height };
 
 	if (!sameRect(next, bounds)) {
-		hudOverlayWindow.setBounds(next, false);
+		setUnresizableWindowBounds(hudOverlayWindow, next);
 	}
 	reassertAlwaysOnTop(hudOverlayWindow);
 });
@@ -443,7 +468,9 @@ ipcMain.on("hud-overlay-set-size", (_event, width: number, height: number, conte
 // The visible stack changed without a resize: the bar grew into its reserve, or a
 // popover or notice opened above it. Re-clamp so none of it is left off screen.
 ipcMain.on("hud-overlay-content", (_event, content: unknown) => {
-	const nextContent = HUD_CLAMPS_CONTENT ? parseHudContentRect(content) : null;
+	const parsed = parseHudContentRect(content);
+	hudStackRect = parsed ?? hudStackRect;
+	const nextContent = HUD_CLAMPS_CONTENT ? parsed : null;
 	if (!nextContent) return;
 	hudContentRect = nextContent;
 	reclampHud();
@@ -458,11 +485,16 @@ export function createHudOverlayWindow(): BrowserWindow {
 	const primaryDisplay = screen.getPrimaryDisplay();
 	const { workArea } = primaryDisplay;
 
-	// Close to what the renderer asks for on its very first measurement (bar plus
-	// the reserved space above it), so the HUD doesn't visibly resize itself the
-	// instant it becomes visible. See src/components/launch/hudGeometry.ts.
-	const windowWidth = 820;
-	const windowHeight = 560;
+	// Close to what the renderer asks for on its very first measurement, so the HUD
+	// doesn't visibly resize itself the instant it becomes visible. Windows and macOS
+	// ask for the bar plus the reserved space above it; Linux hugs the bar (the HUD
+	// is not click-through there, so a reserve would swallow desktop clicks until the
+	// first measurement). See src/components/launch/hudGeometry.ts.
+	// Wayland is the exception: the HUD cannot move its window there, so it keeps the reserve.
+	const isLinux = process.platform === "linux";
+	const wayland = usesWaylandBackend(process.platform, app.commandLine, process.env);
+	const windowWidth = isLinux ? 600 : 820;
+	const windowHeight = isLinux && !wayland ? 190 : 560;
 
 	const x = Math.floor(workArea.x + (workArea.width - windowWidth) / 2);
 	const y = Math.floor(workArea.y + workArea.height - windowHeight - 5);
@@ -542,17 +574,18 @@ export function createHudOverlayWindow(): BrowserWindow {
 			hudDragOrigin = null;
 			// The next HUD is a new window: a rect measured in this one would misplace it.
 			hudContentRect = null;
+			hudStackRect = null;
 			hudBarHome = null;
 			stopHudCursorPoll();
 		}
 	});
 
+	const query: Record<string, string> = { windowType: "hud-overlay" };
+	if (wayland) query.hudWayland = "1";
 	if (VITE_DEV_SERVER_URL) {
-		win.loadURL(VITE_DEV_SERVER_URL + "?windowType=hud-overlay");
+		win.loadURL(`${VITE_DEV_SERVER_URL}?${new URLSearchParams(query)}`);
 	} else {
-		win.loadFile(path.join(RENDERER_DIST, "index.html"), {
-			query: { windowType: "hud-overlay" },
-		});
+		win.loadFile(path.join(RENDERER_DIST, "index.html"), { query });
 	}
 
 	markSheetless(win);
@@ -860,15 +893,112 @@ export function createPermissionsWindow(): BrowserWindow {
 	return win;
 }
 
+let cameraPreviewWindow: BrowserWindow | null = null;
+
+export function getCameraPreviewWindow(): BrowserWindow | null {
+	return cameraPreviewWindow && !cameraPreviewWindow.isDestroyed() ? cameraPreviewWindow : null;
+}
+
+/** The camera stream belongs to the HUD; this window only displays preview frames. */
+export function createCameraPreviewWindow(): BrowserWindow {
+	const initialBounds = () => {
+		const bar =
+			hudOverlayWindow && !hudOverlayWindow.isDestroyed() && hudContentRect
+				? hudContentScreenRect(hudOverlayWindow.getBounds(), hudContentRect)
+				: undefined;
+		const workArea = bar
+			? screen.getDisplayMatching(bar).workArea
+			: screen.getPrimaryDisplay().workArea;
+		return cameraPreviewBounds(workArea, bar);
+	};
+	const win = new BrowserWindow({
+		...initialBounds(),
+		title: "OpenScreen - Camera Preview",
+		hasShadow: false,
+		frame: false,
+		transparent: true,
+		backgroundColor: "#00000000",
+		resizable: false,
+		maximizable: false,
+		minimizable: false,
+		alwaysOnTop: true,
+		skipTaskbar: true,
+		show: false,
+		webPreferences: {
+			preload: path.join(__dirname, "preload.mjs"),
+			additionalArguments: [ASSET_BASE_URL_ARG],
+			nodeIntegration: false,
+			contextIsolation: true,
+			backgroundThrottling: false,
+		},
+	});
+	win.once("ready-to-show", () => win.setBounds(initialBounds()));
+	applyContentProtection(win, "Camera Preview");
+	keepAlwaysOnTop(win);
+	followAcrossSpaces(win);
+	cameraPreviewWindow = win;
+	win.on("closed", () => {
+		if (cameraPreviewWindow === win) cameraPreviewWindow = null;
+	});
+	if (VITE_DEV_SERVER_URL) {
+		win.loadURL(VITE_DEV_SERVER_URL + "?windowType=camera-preview");
+	} else {
+		win.loadFile(path.join(RENDERER_DIST, "index.html"), {
+			query: { windowType: "camera-preview" },
+		});
+	}
+	return win;
+}
+
+export function resizeCameraPreviewWindow(
+	win: BrowserWindow,
+	width: number,
+	aspectRatio: number,
+): void {
+	const bounds = win.getBounds();
+	setUnresizableWindowBounds(
+		win,
+		resizedCameraPreviewBounds(
+			bounds,
+			screen.getDisplayMatching(bounds).workArea,
+			width,
+			aspectRatio,
+		),
+	);
+}
+
+/**
+ * Hides the camera preview without unmapping it: 1×1, where its margins leave nothing to draw.
+ * For Wayland, where an unmapped preview is placed anew when it comes back (see
+ * CameraPreviewController); resizeCameraPreviewWindow brings it back to size.
+ */
+export function parkCameraPreviewWindow(win: BrowserWindow): void {
+	setUnresizableWindowBounds(win, { ...win.getBounds(), width: 1, height: 1 });
+}
+
 // Frameless Notes Window for taking notes during a recording.
 export function createNotesWindow(): BrowserWindow {
+	const wayland = usesWaylandBackend(process.platform, app.commandLine, process.env);
+	// Read again when the Wayland window shrinks: the HUD may report a new stack top meanwhile.
+	const notesSize = () => {
+		const height = notesWindowHeight(wayland, hudStackRect?.y ?? null);
+		return {
+			size: { width: 400, height },
+			min: { width: 360, height: Math.min(NOTES_WINDOW_MIN_HEIGHT, height) },
+			max: { width: 640, height: 720 },
+		};
+	};
+	const { size, min, max } = notesSize();
 	const win = new BrowserWindow({
-		width: 400,
-		height: 540,
-		minWidth: 360,
-		minHeight: 400,
-		maxWidth: 640,
-		maxHeight: 720,
+		width: size.width,
+		// On Wayland it opens taller than the screen, so mutter can only put it at the top edge,
+		// clear of the HUD bar, and shrinks once placed (notesPlacement.ts).
+		height: wayland
+			? topEdgeOpeningHeight(screen.getAllDisplays().map((d) => d.bounds.height))
+			: size.height,
+		minWidth: min.width,
+		minHeight: min.height,
+		...(wayland ? {} : { maxWidth: max.width, maxHeight: max.height }),
 		title: "OpenScreen - Notes",
 		backgroundColor: "#09090b",
 		resizable: true,
@@ -894,6 +1024,7 @@ export function createNotesWindow(): BrowserWindow {
 	win.once("ready-to-show", () => {
 		applyContentProtection(win, "Notes");
 		win.show();
+		if (wayland) shrinkOncePlaced(win, notesSize);
 	});
 
 	if (VITE_DEV_SERVER_URL) {

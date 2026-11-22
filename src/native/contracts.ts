@@ -1,3 +1,4 @@
+import type { ChatExecutionStep } from "../lib/ai-edition/chatExecution";
 import type { StylePreset, StylePresetAppearance } from "../lib/ai-edition/stylePresets";
 
 export const NATIVE_BRIDGE_CHANNEL = "native-bridge:invoke";
@@ -283,6 +284,25 @@ export interface AiEditionDocumentResult {
 	error?: string;
 }
 
+/** What happens to the recordings a project owns when it is deleted. */
+export type AiEditionRecordingsDisposal = "keep" | "trash" | "permanent";
+
+export interface AiEditionDeleteResult extends AiEditionDocumentResult {
+	/** The recordings could not go to the Trash; nothing was deleted, and a permanent delete may be offered. */
+	trashFailed?: boolean;
+}
+
+export interface AiEditionProjectRecordingsResult {
+	success: boolean;
+	count: number;
+	sizeBytes: number;
+	/** Titles of the other projects that keep some of this project's recordings in use. */
+	keptFor: string[];
+	/** Project files that did not parse. While there are some, every recording is kept. */
+	unreadable: number;
+	error?: string;
+}
+
 export interface AiEditionLlmConfig {
 	provider: string;
 	model: string;
@@ -384,8 +404,25 @@ export interface AiEditionToolCallSummary {
 	summary: string;
 }
 
+/** Usage reported by observable model calls in one agent turn, not HTTP billing. */
+export interface AgentTurnUsage {
+	inputTokens: number;
+	outputTokens: number;
+	totalTokens: number;
+	modelCallCount: number;
+	countedCallCount: number;
+	status: "complete" | "partial" | "unavailable";
+	cachedInputTokens?: number;
+	cacheCreationInputTokens?: number;
+	reasoningOutputTokens?: number;
+}
+
 export interface AiEditionChatMessage {
+	executionSteps?: ChatExecutionStep[];
 	stopped?: boolean;
+	/** Elapsed agent turn time, measured in the main process. Absent on older messages. */
+	durationMs?: number;
+	usage?: AgentTurnUsage;
 	id: string;
 	role: "user" | "assistant";
 	content: string;
@@ -401,6 +438,7 @@ export interface AiEditionChatMessage {
 
 export interface AiEditionChatResult {
 	cancelled?: boolean;
+	userMessage?: AiEditionChatMessage;
 	success: boolean;
 	assistantMessage?: AiEditionChatMessage;
 	/** Updated document when the agent ran write tools during this turn. */
@@ -646,6 +684,12 @@ export type NativeBridgeRequest =
 	| {
 			domain: "aiEdition";
 			action: "document.delete";
+			payload: { projectId: string; recordings?: AiEditionRecordingsDisposal };
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "document.recordings";
 			payload: { projectId: string };
 			requestId?: string;
 	  }
@@ -1029,8 +1073,10 @@ export type NativeBridgeEventName =
 // provider failed and the toast was a side-channel; the renderer shows it
 // inline so the chat doesn't appear to "echo back my question".
 export type AiEditionChatEvent = { projectId: string; runId: string } & (
+	| { kind: "executionStep"; sessionId: string; step: ChatExecutionStep }
 	| { kind: "text"; sessionId: string; delta: string }
 	| { kind: "thinking"; sessionId: string; delta: string }
+	| { kind: "usage"; sessionId: string; usage: AgentTurnUsage }
 	| { kind: "toolStart"; sessionId: string; name: string; args: unknown }
 	| { kind: "toolEnd"; sessionId: string; name: string; ok: boolean; summary?: string }
 	| { kind: "error"; sessionId: string; message: string }

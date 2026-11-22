@@ -32,13 +32,16 @@ export async function serveMcpOverStdio(options: {
 	runners: MediaToolDeps["runners"];
 	openVideo: MediaToolDeps["openVideo"];
 	renderFrames?: MediaToolDeps["renderFrames"];
+	/** A newer OpenScreen to tell the agent about (update-notice.ts). */
+	updateNotice?: string;
 	/** The client went away: nothing is left to serve. */
 	onClose(): void;
-}): Promise<void> {
+}): Promise<{ isBusy(): boolean }> {
 	const deps: McpToolDeps = {
 		...options.mcpToolDeps,
 		transport: "stdio",
 		editsAllowed: () => true,
+		updateNotice: options.updateNotice,
 	};
 	// The media tools' own document calls (stopRecording's checkpoint, setPointerTrack)
 	// take the same route.
@@ -71,4 +74,5 @@ export async function serveMcpOverStdio(options: {
 	stdin.once("close", close);
 	stdin.once("error", close);
 	await server.connect(new StdioServerTransport(stdin, process.stdout));
+	return { isBusy: media.isBusy };
 }

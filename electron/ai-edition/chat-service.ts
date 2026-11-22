@@ -7,6 +7,7 @@
 
 import { randomUUID } from "node:crypto";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import type { ChatExecutionStep, ToolExecutionStep } from "../../src/lib/ai-edition/chatExecution";
 import {
 	type AxcutTimelineOperation,
 	applyTimelineOperation,
@@ -18,6 +19,7 @@ import {
 } from "../../src/lib/ai-edition/schema";
 import type { ShaderEffectChecker } from "../../src/lib/ai-edition/shaderEffects";
 import type {
+	AgentTurnUsage,
 	AiEditionChatMessage,
 	AiEditionChatResult,
 	AiEditionToolCallSummary,
@@ -32,6 +34,7 @@ import {
 	compactionSplitIndex,
 	DEFAULT_BUDGET_TOKENS,
 } from "./chat-compaction";
+import { createExecutionTracker } from "./chat-execution";
 import { ChatPersistence } from "./chat-persistence";
 import type { CursorTelemetryReader } from "./deep-agent/service";
 import type { DocumentService } from "./document-service";
@@ -297,6 +300,8 @@ export function deleteSession(projectId: string, sessionId: string): boolean {
 }
 
 export interface ChatEventSink {
+	usage?: (usage: AgentTurnUsage) => void;
+	executionStep?: (step: ChatExecutionStep) => void;
 	/** Streamed text delta from the model. */
 	text?: (delta: string) => void;
 	/** Streamed delta from the model's reasoning block (Anthropic/MiniMax
@@ -331,6 +336,8 @@ const noop = () => undefined;
 
 /** ponytail: zero-config sink that swallows every event. */
 const NOOP_SINK: Required<ChatEventSink> = {
+	usage: noop,
+	executionStep: noop,
 	text: noop,
 	thinking: noop,
 	toolStart: noop,
@@ -436,9 +443,30 @@ export async function runChat(
 
 	const appliedToolCalls: AiEditionToolCallSummary[] = [];
 
+	const originatingSession = session;
+	const isOriginValid = () =>
+		sessionsByProject.get(projectId) === sessions &&
+		sessions.get(originatingSession.id) === originatingSession &&
+		originatingSession.messages.includes(userMessage);
+	let pendingSave: ReturnType<typeof setTimeout> | undefined;
+	const execution = createExecutionTracker((step) => {
+		if (!isOriginValid()) return;
+		userMessage.executionSteps = execution.snapshot();
+		emit.executionStep(step);
+		// A start is written at once: restart recovery can only stop a step it can read.
+		if (step.kind === "tool" && step.status === "running") persistProject(projectId);
+		else if (!pendingSave)
+			pendingSave = setTimeout(() => {
+				pendingSave = undefined;
+				if (isOriginValid()) persistProject(projectId);
+			}, 200);
+	});
 	let acceptingEvents = true;
 	const canEmit = () => acceptingEvents && !env.signal?.aborted;
 	const agentSink = {
+		executionStep: (step: ToolExecutionStep) => {
+			if (acceptingEvents && isOriginValid()) execution.tool(step);
+		},
 		document: (document: AxcutDocument) => {
 			if (editsAllowed && canEmit()) emit.document(document);
 		},
@@ -446,7 +474,13 @@ export async function runChat(
 			if (canEmit()) emit.text(delta);
 		},
 		thinking: (delta: string) => {
-			if (canEmit()) emit.thinking(delta);
+			if (canEmit()) {
+				emit.thinking(delta);
+				execution.thinking(delta);
+			}
+		},
+		usage: (usage: AgentTurnUsage) => {
+			if (canEmit()) emit.usage(usage);
 		},
 		toolStart: (name: string, args: unknown) => {
 			if (canEmit()) emit.toolStart(name, args);
@@ -465,6 +499,7 @@ export async function runChat(
 
 	const { invokeOpenScreenAgent } = await import("./deep-agent/service");
 
+	const startedAt = performance.now();
 	const result = await invokeOpenScreenAgent({
 		signal: env.signal,
 		document: workingDocument ?? emptyDocumentForTextOnly(projectId),
@@ -485,12 +520,27 @@ export async function runChat(
 		checkShaderEffect: env.checkShaderEffect,
 	});
 
+	const executionSteps = execution.finish(Boolean(result.cancelled));
+	if (pendingSave) clearTimeout(pendingSave);
 	acceptingEvents = false;
+	const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 
 	// The project was deleted while the agent ran: its sessions are gone, so a
 	// reply recorded now would be reported as sent and then never be seen again.
 	if (sessionsByProject.get(projectId) !== sessions) {
 		return { success: false, error: "The project was deleted while the agent was replying." };
+	}
+
+	// Bind the turn to the actual session and user message captured above, even
+	// when the caller supplied a stale id or selected another session meanwhile.
+	if (sessions.get(session.id) !== session) {
+		return { success: false, error: "The chat session was deleted while the agent was replying." };
+	}
+	const originatingMessage = session.messages.find((entry) => entry.id === userMessage.id);
+	// Rewind preserves message ids but replaces survivors with copies. Identity
+	// also rejects a turn whose own user message was the rewind target.
+	if (originatingMessage !== userMessage) {
+		return { success: false, error: "The chat was rewound while the agent was replying." };
 	}
 
 	if (!result.text && !result.cancelled) {
@@ -499,20 +549,28 @@ export async function runChat(
 		// thinking blocks, or a non-text content shape that our extractor
 		// missed). Falls back to the generic message when the agent didn't
 		// provide a reason.
+		originatingMessage.usage = result.usage;
+		originatingMessage.durationMs = durationMs;
+		persistProject(projectId);
 		return {
 			success: false,
 			error: result.reason ?? "Empty response from model.",
 			// The message is stored all the same, and can be rewound to retry it.
 			userMessageId: userMessage.id,
 			userMessageCheckpointId: userMessage.checkpointId ?? undefined,
+			userMessage: originatingMessage,
 		};
 	}
 
+	delete userMessage.executionSteps;
 	const assistantMessage: AiEditionChatMessage = {
+		executionSteps,
 		id: randomUUID(),
 		role: "assistant",
 		content: result.text,
 		stopped: result.cancelled || undefined,
+		usage: result.usage,
+		durationMs,
 		createdAt: new Date().toISOString(),
 		toolCalls: appliedToolCalls.length ? appliedToolCalls : undefined,
 	};
@@ -705,6 +763,7 @@ export async function compactSessionNow(
 		model: config.model,
 		baseUrl: config.baseUrl,
 		reasoningEffort: config.reasoningEffort,
+		throwOnError: true,
 	});
 	if (!ok) return null;
 	persistProject(projectId);
@@ -850,6 +909,7 @@ async function tryCompactSession(opts: {
 	model: string;
 	baseUrl?: string;
 	reasoningEffort?: string;
+	throwOnError?: boolean;
 }): Promise<{ summaryMessageId: string | null; summary: string } | null> {
 	const { session, plan, apiKey, provider, model, baseUrl, reasoningEffort } = opts;
 	const oldMessages = plan.payload.slice(0, plan.splitIndex);
@@ -876,7 +936,10 @@ async function tryCompactSession(opts: {
 		if (!summary) {
 			return null;
 		}
-	} catch {
+	} catch (error) {
+		// A button press must reach the renderer's failure toast; `null` means
+		// there was not enough history, not that the provider could not be reached.
+		if (opts.throwOnError) throw error;
 		// ponytail: a failed summarize must not break the chat turn — leave
 		// the session as-is and let the next turn try again.
 		return null;

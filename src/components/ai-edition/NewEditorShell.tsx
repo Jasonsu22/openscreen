@@ -49,10 +49,14 @@ import {
 	trimAppliesToClip,
 	ventilateTimelineSpanToTrims,
 } from "@/lib/ai-edition/timeline/trim-mapping";
+import {
+	locateVirtualPosition,
+	totalVirtualDuration,
+} from "@/lib/ai-edition/timeline/virtual-preview";
 import { firstTimelineBusyView } from "@/lib/ai-edition/transcription/status";
 import { matchesShortcut } from "@/lib/shortcuts";
 import { nativeBridgeClient } from "@/native";
-import type { AiEditionProjectSummary } from "@/native/contracts";
+import type { AiEditionProjectSummary, AiEditionRecordingsDisposal } from "@/native/contracts";
 import { resolveVisibleClips } from "@/native/sceneDescription";
 import { useNativePlaybackSync } from "@/native/useNativePlaybackSync";
 import { ExportDialog } from "./ExportDialog";
@@ -81,6 +85,7 @@ interface SeekTarget {
 	timeSec: number;
 	isSource?: boolean;
 	requestId: number;
+	preservePlayback?: boolean;
 }
 
 /**
@@ -218,6 +223,11 @@ export function NewEditorShell() {
 
 	const [seekTarget, setSeekTarget] = useState<SeekTarget | null>(null);
 	const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+	const voiceoverPausedRef = useRef(false);
+	const voiceoverSeekEpochRef = useRef(0);
+	const voiceoverActiveRef = useRef(false);
+	const voiceoverSessionRef = useRef(0);
+	const cancelPendingPlaybackRef = useRef<(() => void) | null>(null);
 	// v4 shell: three modes (Media / Edit / Rec), a collapsible agent (chat)
 	// column, and a floating facet inspector over the stage.
 	const [mode, setMode] = useState<EditorMode>("edit");
@@ -285,6 +295,7 @@ export function NewEditorShell() {
 		action: "close" | "new" | "open" | "record";
 		resolve: (choice: UnsavedChoice) => void;
 	} | null>(null);
+	const unsavedPromptRef = useRef<typeof unsavedPrompt>(null);
 	const { shortcuts, isMac, openConfig: openShortcutsConfig } = useShortcuts();
 	// The actions half of the dialog context, not the section: this component only ever *opens*
 	// one, and subscribing it to the open state would re-render the whole editor — timeline,
@@ -356,12 +367,37 @@ export function NewEditorShell() {
 
 	const promptUnsaved = useCallback(
 		(action: "close" | "new" | "open" | "record"): Promise<UnsavedChoice> => {
-			if (!dirty) return Promise.resolve("discard");
+			// A native close can supersede an Open/New prompt, including its pending Save.
+			// Settle that request before replacing the only dialog/resolver slot.
+			unsavedPromptRef.current?.resolve("cancel");
+			unsavedPromptRef.current = null;
+			if (!useProjectStore.getState().dirty) {
+				setUnsavedPrompt(null);
+				return Promise.resolve("discard");
+			}
 			return new Promise<UnsavedChoice>((resolve) => {
-				setUnsavedPrompt({ action, resolve });
+				const prompt = { action, resolve };
+				unsavedPromptRef.current = prompt;
+				setUnsavedPrompt(prompt);
 			});
 		},
-		[dirty],
+		[],
+	);
+	const projectRequestPendingRef = useRef(false);
+	const requestProjectDialog = useCallback(
+		async (action: "new" | "open") => {
+			if (projectRequestPendingRef.current || isModalOpen()) return;
+			projectRequestPendingRef.current = true;
+			try {
+				if ((await promptUnsaved(action)) === "cancel") return;
+				// The prompt's Save action already waits for persistence and cancels on failure.
+				if (action === "new") setNewProjectOpen(true);
+				else setOpenProjectOpen(true);
+			} finally {
+				projectRequestPendingRef.current = false;
+			}
+		},
+		[promptUnsaved],
 	);
 
 	const primaryAssetPath =
@@ -535,12 +571,23 @@ export function NewEditorShell() {
 		[setSourceDuration, enqueueTimelineWrite],
 	);
 
+	const canSeek = useCallback(() => !voiceoverPausedRef.current, []);
+	/** Seek the preview unless a paused take owns its current picture. */
 	const handleSeek = useCallback(
-		(timeSec: number) => {
+		(timeSec: number, preservePlayback?: boolean) => {
+			// A paused take must resume against the same picture, not a scrubbed-to position.
+			if (!canSeek()) return;
 			setCurrentTime(timeSec);
-			setSeekTarget({ timeSec, isSource: false, requestId: ++seekSeqRef.current });
+			setSeekTarget({
+				timeSec,
+				isSource: false,
+				requestId: ++seekSeqRef.current,
+				// The preview owns queued playback while another source loads. Its new
+				// video is initially paused, so the store is not the scrub's intent.
+				preservePlayback,
+			});
 		},
-		[setCurrentTime],
+		[setCurrentTime, canSeek],
 	);
 
 	const handleTimeChange = useCallback(
@@ -602,8 +649,8 @@ export function NewEditorShell() {
 	useEffect(() => {
 		const el = videoElement;
 		if (!el) return;
-		const onPlay = () => setPlaying(true);
-		const onPause = () => setPlaying(false);
+		const onPlay = () => setPlaying(!el.paused);
+		const onPause = () => setPlaying(!el.paused);
 		// BUG corrigé : ce listener écoutait le même événement DOM natif 'ended' que le
 		// onEnded interne de VirtualPreview.tsx, sans la moindre logique multi-clip — il
 		// mettait TOUJOURS `playing` à false, y compris quand VirtualPreview venait
@@ -614,9 +661,12 @@ export function NewEditorShell() {
 		// suivant ?" que VirtualPreview — seul point de
 		// vérité pour "y a-t-il encore de la timeline à jouer".
 		const onEnded = () => {
+			if (!el.paused) return;
 			const playhead = useProjectStore.getState().currentTimeSec;
+			const duration = totalVirtualDuration(clipsForEndedRef.current);
+			const isAtEnd = duration > 0 && playhead >= duration - 0.1;
 			const hasNextClip = clipsForEndedRef.current.some((c) => c.timelineStartSec > playhead + 0.1);
-			if (!hasNextClip) setPlaying(false);
+			if (isAtEnd && !hasNextClip) setPlaying(false);
 		};
 		el.addEventListener("play", onPlay);
 		el.addEventListener("pause", onPause);
@@ -631,9 +681,33 @@ export function NewEditorShell() {
 		// here doesn't cause this effect to re-subscribe on every playhead tick.
 	}, [videoElement, setPlaying]);
 
+	/** Toggle ordinary playback; paused takes resume through the recording bar. */
 	const togglePlay = useCallback(() => {
+		// Resume the microphone and picture together from the voiceover bar.
+		if (voiceoverPausedRef.current) return;
 		if (!videoElement) return;
 		if (videoElement.paused) {
+			const playhead = useProjectStore.getState().currentTimeSec;
+			const duration = totalVirtualDuration(clipsForEndedRef.current);
+			const endPos = locateVirtualPosition(clipsForEndedRef.current, duration);
+			const currentPos = locateVirtualPosition(clipsForEndedRef.current, playhead);
+			const hasNextClip = clipsForEndedRef.current.some((c) => c.timelineStartSec > playhead + 0.1);
+			const isAtEnd =
+				duration > 0 &&
+				playhead >= duration - 0.05 &&
+				!hasNextClip &&
+				currentPos?.clip.id === endPos?.clip.id;
+			if (isAtEnd) {
+				handleSeek(0, true);
+				const startPos = locateVirtualPosition(clipsForEndedRef.current, 0);
+				if (startPos && startPos.clip.assetId === endPos?.clip.assetId) {
+					try {
+						videoElement.currentTime = startPos.sourceTimeSec;
+					} catch {
+						// media metadata not ready yet
+					}
+				}
+			}
 			// Same catch as VirtualPreview's: `play()` rejects on the autoplay policy
 			// or when a new load interrupts it, and the store's `playing` flag is
 			// driven by the element's own play/pause listeners above — so a rejection
@@ -644,7 +718,7 @@ export function NewEditorShell() {
 		} else {
 			videoElement.pause();
 		}
-	}, [videoElement]);
+	}, [videoElement, handleSeek]);
 
 	// "Transcribe now" from the transcript pane. The run itself belongs to the
 	// transcription store (it owns the queue, the toasts and the failure
@@ -857,26 +931,30 @@ export function NewEditorShell() {
 		[createProject],
 	);
 
-	// The only way to get rid of a project short of deleting its file by hand.
-	// Media is left alone on purpose: a recording can back several projects, and
-	// the dialog says so before it asks.
-	const handleDeleteProject = useCallback(async (id: string) => {
-		try {
-			const result = await nativeBridgeClient.aiEdition.delete(id);
-			if (!result.success) throw new Error(result.error ?? "Failed to delete project");
-			setProjectSummaries((prev) => prev.filter((p) => p.id !== id));
-			// Deleting the project that is open leaves the editor pointing at a file
-			// that no longer exists — any save from there would recreate it.
-			if (useProjectStore.getState().projectId === id) {
-				useProjectStore.getState().clear();
+	// Recordings are kept unless the user opts in, and even then only the ones no other
+	// project uses (`electron/ai-edition/project-recordings.ts`).
+	const handleDeleteProject = useCallback(
+		async (id: string, recordings: AiEditionRecordingsDisposal) => {
+			try {
+				const result = await nativeBridgeClient.aiEdition.delete(id, recordings);
+				if (!result.success && result.trashFailed) return { trashFailed: true };
+				if (!result.success) throw new Error(result.error ?? "Failed to delete project");
+				setProjectSummaries((prev) => prev.filter((p) => p.id !== id));
+				// Deleting the project that is open leaves the editor pointing at a file
+				// that no longer exists — any save from there would recreate it.
+				if (useProjectStore.getState().projectId === id) {
+					useProjectStore.getState().clear();
+				}
+				toast.success("Project deleted");
+			} catch (err) {
+				toast.error("Could not delete project", {
+					description: err instanceof Error ? err.message : String(err),
+				});
 			}
-			toast.success("Project deleted");
-		} catch (err) {
-			toast.error("Could not delete project", {
-				description: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}, []);
+			return undefined;
+		},
+		[],
+	);
 
 	const handleSave = useCallback(async () => {
 		const doc = useProjectStore.getState().document;
@@ -899,8 +977,8 @@ export function NewEditorShell() {
 		const api = window.electronAPI;
 		if (!api) return;
 		const unsubscribers = [
-			api.onMenuNewProject?.(() => setNewProjectOpen(true)),
-			api.onMenuLoadProject?.(() => setOpenProjectOpen(true)),
+			api.onMenuNewProject?.(() => void requestProjectDialog("new")),
+			api.onMenuLoadProject?.(() => void requestProjectDialog("open")),
 			api.onMenuSaveProject?.(() => void handleSave()),
 			api.onMenuSaveProjectAs?.(() => void handleSave()),
 			api.onMenuUndo?.(runUndo),
@@ -909,7 +987,7 @@ export function NewEditorShell() {
 		return () => {
 			for (const unsub of unsubscribers) unsub?.();
 		};
-	}, [handleSave, runUndo, runRedo]);
+	}, [handleSave, runUndo, runRedo, requestProjectDialog]);
 
 	const handleRenameProject = useCallback(
 		async (title: string) => {
@@ -924,7 +1002,12 @@ export function NewEditorShell() {
 	const handleConfirmUnsaved = useCallback(
 		(choice: UnsavedChoice) => {
 			if (!unsavedPrompt) return;
+			const prompt = unsavedPrompt;
 			const { action, resolve } = unsavedPrompt;
+			const settle = (result: UnsavedChoice) => {
+				if (unsavedPromptRef.current === prompt) unsavedPromptRef.current = null;
+				resolve(result);
+			};
 			setUnsavedPrompt(null);
 			// ponytail: resolve the action when the user picks save / discard.
 			// The "continue with action" path is handled below in handleNewRecording /
@@ -932,7 +1015,7 @@ export function NewEditorShell() {
 			// (or cancelled).
 			void (async () => {
 				if (choice === "cancel") {
-					resolve("cancel");
+					settle("cancel");
 					return;
 				}
 				if (choice === "save") {
@@ -940,17 +1023,18 @@ export function NewEditorShell() {
 					// A failed save cancels the action that prompted this dialog. The store has
 					// already said why -- which is what the bare `catch {}` here used to swallow,
 					// leaving the window refusing to close with nothing on screen explaining it.
-					if (doc && !(await saveDocument(doc, { history: true }))) {
-						resolve("cancel");
+					if (doc && !(await saveDocument(doc, { history: true, protectLiveEdits: true }))) {
+						settle("cancel");
 						return;
 					}
 				}
+				if (unsavedPromptRef.current !== prompt) return;
 				if (action === "record") {
 					void window.electronAPI?.startNewRecording?.().catch((err) => {
 						console.warn("[editor] failed to start a new recording:", err);
 					});
 				}
-				resolve(choice);
+				settle(choice);
 			})();
 		},
 		[saveDocument, unsavedPrompt],
@@ -1019,7 +1103,11 @@ export function NewEditorShell() {
 	// where it is passed to the preview.
 	const [voiceoverRecording, setVoiceoverRecording] = useState(false);
 
+	/** Anchor a new take at the playhead and start preview playback at normal speed. */
 	const handleVoiceoverRecordingStart = useCallback(async () => {
+		voiceoverSessionRef.current++;
+		voiceoverActiveRef.current = true;
+		voiceoverPausedRef.current = false;
 		// Re-capture: the user may have scrubbed between opening the dialog and
 		// hitting Record, and playback starts from wherever the playhead is now.
 		const doc = useProjectStore.getState().document;
@@ -1035,11 +1123,45 @@ export function NewEditorShell() {
 		if (videoElement.paused) await videoElement.play();
 	}, [videoElement]);
 
+	/** End the take, invalidate pending playback and restore timeline audio. */
 	const handleVoiceoverRecordingStop = useCallback(() => {
+		voiceoverSessionRef.current++;
+		voiceoverActiveRef.current = false;
+		voiceoverPausedRef.current = false;
 		setVoiceoverRecording(false);
+		cancelPendingPlaybackRef.current?.();
 		videoElement?.pause();
 	}, [videoElement]);
 
+	/** Freeze the picture and invalidate queued scrubs without ending the take. */
+	const handleVoiceoverRecordingPause = useCallback(() => {
+		voiceoverPausedRef.current = true;
+		voiceoverSeekEpochRef.current++;
+		cancelPendingPlaybackRef.current?.();
+		videoElement?.pause();
+		// Keep voiceoverRecording true: the take still owns the unedited clock and mute.
+	}, [videoElement]);
+
+	/** Resume the picture before the microphone, unless Stop superseded this request. */
+	const handleVoiceoverRecordingResume = useCallback(async () => {
+		if (!voiceoverActiveRef.current) return;
+		if (!videoElement) throw new Error("The preview is not ready.");
+		const doc = useProjectStore.getState().document;
+		const end =
+			doc?.timeline.clips.reduce((max, clip) => Math.max(max, clip.timelineEndSec), 0) ?? 0;
+		if (end > 0 && useProjectStore.getState().currentTimeSec >= end - 0.001) return false;
+		const session = voiceoverSessionRef.current;
+		await videoElement.play();
+		if (session !== voiceoverSessionRef.current) {
+			// A pending play() must not restart the picture after Stop/Cancel.
+			if (!voiceoverActiveRef.current) videoElement.pause();
+			return;
+		}
+		voiceoverPausedRef.current = false;
+		return true;
+	}, [videoElement]);
+
+	/** Place saved audio at the original take anchor using active recording duration. */
 	const handleVoiceoverReady = useCallback(
 		async (assetId: string, durationSec: number) => {
 			setVoiceoverFlow(null);
@@ -1300,30 +1422,12 @@ export function NewEditorShell() {
 			}
 			if (ctrl && e.key === "n") {
 				e.preventDefault();
-				void (async () => {
-					const choice = await promptUnsaved("new");
-					if (choice === "cancel") return;
-					if (choice === "save") {
-						const doc = useProjectStore.getState().document;
-						// Stay put if the save did not land -- the store has already said why.
-						if (doc && !(await saveDocument(doc, { history: true }))) return;
-					}
-					setNewProjectOpen(true);
-				})();
+				void requestProjectDialog("new");
 				return;
 			}
 			if (ctrl && e.key === "o") {
 				e.preventDefault();
-				void (async () => {
-					const choice = await promptUnsaved("open");
-					if (choice === "cancel") return;
-					if (choice === "save") {
-						const doc = useProjectStore.getState().document;
-						// Stay put if the save did not land -- the store has already said why.
-						if (doc && !(await saveDocument(doc, { history: true }))) return;
-					}
-					setOpenProjectOpen(true);
-				})();
+				void requestProjectDialog("open");
 				return;
 			}
 			if (!hasProject && e.key !== "?") return;
@@ -1493,8 +1597,7 @@ export function NewEditorShell() {
 		handleSave,
 		pasteRegion,
 		tl,
-		promptUnsaved,
-		saveDocument,
+		requestProjectDialog,
 		copiedClipId,
 		openShortcutsConfig,
 		shortcuts,
@@ -1613,8 +1716,8 @@ export function NewEditorShell() {
 				canRedo={redoStack.length > 0}
 				chatOpen={chatOpen}
 				actions={{
-					openProject: () => setOpenProjectOpen(true),
-					newProject: () => setNewProjectOpen(true),
+					openProject: () => void requestProjectDialog("open"),
+					newProject: () => void requestProjectDialog("new"),
 					save: () => void handleSave(),
 					export: handleExport,
 					openSettings: handleOpenSettings,
@@ -1719,6 +1822,7 @@ export function NewEditorShell() {
 									onSeek={handleSeek}
 									onLoadedMetadata={handleLoadedMetadata}
 									onVideoElement={setVideoElement}
+									cancelPendingPlaybackRef={cancelPendingPlaybackRef}
 									playing={playing}
 								/>
 							</div>
@@ -1771,6 +1875,8 @@ export function NewEditorShell() {
 						onAnnotationRowCountChange={setAnnotationRowCount}
 						tl={tl}
 						setCurrentTime={handleSeek}
+						canSeek={canSeek}
+						seekEpochRef={voiceoverSeekEpochRef}
 						variant={mode === "media" ? "media" : "edit"}
 						onDropAsset={handleDropAsset}
 						videoSources={videoSources}
@@ -1790,6 +1896,7 @@ export function NewEditorShell() {
 				activeProjectId={projectId}
 				onSelect={handleSelectProject}
 				onDelete={handleDeleteProject}
+				loadRecordings={nativeBridgeClient.aiEdition.recordings}
 				onBrowse={handleBrowseProject}
 			/>
 			<NewProjectModal
@@ -1813,7 +1920,7 @@ export function NewEditorShell() {
 						: null
 				}
 				videoSources={videoSources}
-				onApply={(sStart, sEnd, cropRegion) => {
+				onApply={(sStart, sEnd, cropRegion, rotation) => {
 					if (!editClipTarget) return;
 					const clipId = editClipTarget.id;
 					// One user action, one document, one save. This used to be two calls —
@@ -1822,7 +1929,9 @@ export function NewEditorShell() {
 					// first and one of the two edits vanished silently (#355). It goes on the
 					// shared write queue for the same reason every other timeline edit does:
 					// so it can't clobber, or be clobbered by, a save already in flight.
-					void enqueueTimelineWrite(() => tl.applyClipEdit(clipId, sStart, sEnd, cropRegion));
+					void enqueueTimelineWrite(() =>
+						tl.applyClipEdit(clipId, sStart, sEnd, cropRegion, rotation),
+					);
 					setEditClipTarget(null);
 				}}
 			/>
@@ -1830,6 +1939,7 @@ export function NewEditorShell() {
 				open={unsavedPrompt !== null}
 				onClose={() => {
 					unsavedPrompt?.resolve("cancel");
+					if (unsavedPromptRef.current === unsavedPrompt) unsavedPromptRef.current = null;
 					setUnsavedPrompt(null);
 				}}
 				action={unsavedPrompt?.action ?? "new"}
@@ -1842,7 +1952,7 @@ export function NewEditorShell() {
 				onClose={() => {
 					// Belt and braces: the recorder's own stop handler clears this, but a
 					// flow that ends any other way must not leave the timeline muted.
-					setVoiceoverRecording(false);
+					if (voiceoverActiveRef.current) handleVoiceoverRecordingStop();
 					setVoiceoverFlow(null);
 				}}
 				onComplete={(assetId, durationSec) => {
@@ -1850,6 +1960,8 @@ export function NewEditorShell() {
 				}}
 				onRecordingStart={handleVoiceoverRecordingStart}
 				onRecordingStop={handleVoiceoverRecordingStop}
+				onRecordingPause={handleVoiceoverRecordingPause}
+				onRecordingResume={handleVoiceoverRecordingResume}
 			/>
 		</div>
 	);

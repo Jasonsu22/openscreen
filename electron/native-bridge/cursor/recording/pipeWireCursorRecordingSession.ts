@@ -3,6 +3,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import type { CursorRecordingData } from "../../../../src/native/contracts";
+import { isWaylandSession } from "../../../wayland";
 import {
 	NdjsonLineReader,
 	PipeWireCursorAccumulator,
@@ -69,7 +70,11 @@ function helperCandidates() {
 	].filter((candidate): candidate is string => Boolean(candidate));
 }
 
-export function findPipeWireCursorHelperPath() {
+/**
+ * The helper for a full take, in any session: it records an X11 session directly when no
+ * ScreenCast portal can serve it (see linuxCaptureBackend.ts).
+ */
+export function findLinuxCaptureHelperPath() {
 	for (const candidate of helperCandidates()) {
 		try {
 			accessSync(candidate, fsConstants.X_OK);
@@ -80,6 +85,14 @@ export function findPipeWireCursorHelperPath() {
 	}
 
 	return null;
+}
+
+export function findPipeWireCursorHelperPath() {
+	// The cursor-only session is a ScreenCast portal client, and KDE's portal has no ScreenCast
+	// outside Wayland: on X11 it died on "CreateSession: ... Other" (#1491). There the cursor
+	// comes from the take's own X11 capture, or from screen telemetry.
+	if (!isWaylandSession(process.env)) return null;
+	return findLinuxCaptureHelperPath();
 }
 
 export class PipeWireCursorRecordingSession implements CursorRecordingSession {

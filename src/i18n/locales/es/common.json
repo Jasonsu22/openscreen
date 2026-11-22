@@ -9,10 +9,8 @@
 		"done": "Listo",
 		"open": "Abrir",
 		"checkForUpdates": "Buscar actualizaciones",
-		"updateSettings": "Ajustes de actualización",
-		"updateModeNotify": "Avisar cuando haya una actualización",
-		"updateModeDownload": "Descargar actualizaciones automáticamente",
-		"updateModeDownloadAndInstall": "Descargar e instalar actualizaciones automáticamente",
+		"update": "Actualizar",
+		"updateTo": "Actualizar a {{version}}",
 		"usagePing": "Enviar recuento de uso anónimo",
 		"viewRelease": "Ver versión",
 		"downloadUpdate": "Descargar actualización",
@@ -56,7 +54,6 @@
 		"available": "OpenScreen {{latestVersion}} está disponible. Estás usando {{currentVersion}}.",
 		"current": "OpenScreen está actualizado ({{currentVersion}}).",
 		"readyToInstall": "Se ha descargado OpenScreen {{latestVersion}}. Reinicia para completar la instalación.",
-		"downloaded": "Se ha descargado OpenScreen {{latestVersion}}.",
 		"blockedRecording": "Termina la grabación antes de instalar la actualización.",
 		"blockedLocation": "Mueve OpenScreen a la carpeta Aplicaciones antes de actualizar.",
 		"failed": "No se pudieron buscar actualizaciones.",
@@ -75,5 +72,9 @@
 		"screen": "Pantalla",
 		"virtual": "Pantalla virtual",
 		"unknown": "Grabación de pantalla"
+	},
+	"presenterOverlay": {
+		"interruptedTitle": "La grabación de cámara puede estar incompleta",
+		"interruptedDescription": "La superposición del presentador puede haber interrumpido la cámara. Desactívala y graba de nuevo."
 	}
 }

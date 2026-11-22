@@ -1,3 +1,4 @@
+import type { ToolRunnableConfig } from "@langchain/core/tools";
 // ponytail: port of axcut's AxcutDeepAgentService (apps/server/src/services/
 // axcut-deep-agent.ts). Wraps LangChain's `createAgent` (LangGraph ReAct graph)
 // with our existing document tools and emits agent.text / agent.toolStart /
@@ -32,6 +33,7 @@ import {
 	CAPTION_WORDS_PER_LINE_MAX,
 	CAPTION_WORDS_PER_LINE_MIN,
 } from "../../../src/lib/ai-edition/captions/wordsPerLine";
+import type { ToolExecutionStep } from "../../../src/lib/ai-edition/chatExecution";
 import { AUDIO_FADE_MAX_MS } from "../../../src/lib/ai-edition/document/audioTracks";
 import { VOCABULARY_MAX_CHARS } from "../../../src/lib/ai-edition/document/transcript";
 import type { AxcutDocument } from "../../../src/lib/ai-edition/schema";
@@ -47,7 +49,7 @@ import {
 	ZOOM_DEPTH_LEGEND,
 } from "../../../src/lib/ai-edition/timeline/zoom-scale";
 import { ZOOM_TRANSITION_LEGEND } from "../../../src/lib/ai-edition/timeline/zoom-transitions";
-import type { SegmentationSupport } from "../../../src/native/contracts";
+import type { AgentTurnUsage, SegmentationSupport } from "../../../src/native/contracts";
 import {
 	AGENT_EDITS_SETTING,
 	type AgentToolExecution,
@@ -101,6 +103,12 @@ import {
 	setCaptionSettingsArgs,
 	setVocabularyArgs,
 } from "../caption-tools";
+import {
+	createToolExecutionObserver,
+	executionSummary,
+	executionText,
+	toolExecutionStep,
+} from "../chat-execution";
 import { setEditorSettingsArgs } from "../editor-settings-tool";
 import { abortable } from "./cancellation";
 import {
@@ -109,8 +117,12 @@ import {
 	messageContentToThinking,
 	type OpenScreenChatModelConfig,
 } from "./chat-model";
+import { createTurnUsageAccumulator } from "./usage";
 
 export interface OpenScreenAgentSink {
+	/** Latest cumulative usage from completed model calls; never sum stream chunks. */
+	usage?: (usage: AgentTurnUsage) => void;
+	executionStep?: (step: ToolExecutionStep) => void;
 	text: (delta: string) => void;
 	/** Streaming delta from the model's reasoning block (Anthropic/MiniMax
 	 * thinking). Provider-agnostic — for providers without thinking this is
@@ -234,7 +246,7 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
 	setWordText:
 		"Correct ONE word's text, by the id getTranscriptWords returns. This changes the TRANSCRIPT and nothing else: the captions follow it, the film is untouched and no audio is cut. Use it when the transcriber misheard something — a name, a technical term — and the user asks for it to read correctly. Passing an empty string BLANKS the word: it keeps its place in the media but leaves the captions, which is how a junk token like \"(inaudible)\" is removed without cutting the speech around it. Writing the transcriber's own text back clears the correction. This is NOT how you make a spoken word go away — that removes only the label and leaves the film saying it; use removeWords, which cuts the audio with it.",
 	removeWords:
-		"Cut the spoken words selected by `wordIds` from getTranscriptWords out of the film: fillers, a repeated or flubbed phrase, a false start, a duplicate take. Pass the same `assetId` as that read: word IDs are numbered independently in each asset. Omit assetId only when the IDs are unique across all transcripts. Read words in context and choose the IDs yourself; the executor does not classify speech or remove every matching text. It resolves each ID to one recorded asset, valid source timestamps, and exactly one fully covering clip, then adds non-destructive trims; words that follow one another in the transcript become ONE trim, so a phrase goes out whole, gaps included. If any ID is missing, invalid, duplicated, already cut or ambiguous, nothing changes. The transcript is untouched. The result lists each word and the ACTUAL trim span (which addTrim may shape), asset, clip and trim ID; report only those results. " +
+		"Cut the spoken words selected by `wordIds` from getTranscriptWords out of the film: fillers, a repeated or flubbed phrase, a false start, a duplicate take. Pass the same `assetId` as that read: word IDs are numbered independently in each asset. Omit assetId only when the IDs are unique across all transcripts. Read words in context and choose the IDs yourself; the executor does not classify speech or remove every matching text. It resolves each ID to one recorded asset, valid source timestamps, and exactly one fully covering clip, then adds non-destructive trims; words that follow one another in the transcript become ONE trim, so a phrase goes out whole, gaps included. If any ID is missing, invalid, duplicated, already cut or ambiguous, nothing changes. The transcript words and timings are preserved. Cut words remain visible with a red strikethrough; hovering a cut word reveals Restore. Do not claim that the transcript is unmarked or that strikethrough is unavailable. The result lists each word and the ACTUAL trim span (which addTrim may shape), asset, clip and trim ID; report only those results. " +
 		CUT_TRANSITIONS_RESULT,
 	addTrim: `Add ONE trim range: a cut of a span inside a clip (this source-time span will not be played or exported) that does NOT split the clip. Times are in seconds of the asset's source time. This is the preferred (and for 'remove silences' requests, the only) way to handle silences; it preserves the user's placed clips and only adds a cut. When you have several cuts to make, use addTrims and send them together — this one is for a single cut or a later correction. A cut belongs to ONE clip: \`clipId\` is inferred when a single clip covers the range, but when several clips draw on the same asset over it the call FAILS and lists them — pass the \`clipId\` you mean (ids come from getCurrentDocument). ${ZOOM_TRANSITIONS_NOTE} ${CUT_TRANSITIONS_RESULT}`,
 	addTrims: `Add MANY trim ranges in one call: \`ranges\` is a list, each entry taking exactly the fields addTrim takes. Use this whenever you have more than one cut to make — 'remove the silences' on a half-hour recording is hundreds of cuts, and sending them one at a time costs one round trip each. Each range stands or falls ALONE: one that cannot be placed is refused by itself and listed in \`refused\` with its index and the reason, while every other range is still applied. Nothing is rolled back, so a single bad bound never costs you the rest. The result leads with requested / appliedCount / refusedCount so you can see a partial outcome without re-reading the document — report what was refused rather than claiming the whole list landed. ${ZOOM_TRANSITIONS_NOTE} Each applied entry carries the same \`cutTransitions\` warning addTrim reports.`,
@@ -265,7 +277,7 @@ export const TOOL_DESCRIPTIONS: Record<string, string> = {
 	setAspectRatio:
 		"Set the shape of the exported video: 16:9 for X, YouTube or a slide, 9:16 for a vertical story or short, 1:1 or 4:5 for a square feed, auto to follow the recording, or one of the clips' own shapes (getCurrentDocument's settingsContext.originalAspectRatios). Annotations on the frame keep their place and shape. The same as setEditorSettings with aspectRatio alone.",
 	setEditorSettings:
-		'Change the project\'s look: pass only the settings to change, named as getCurrentDocument returns them under `settings`. Background: wallpaper (a bundled path from settingsContext.bundledWallpapers, a CSS colour or gradient, or a base64 PNG/JPEG data URL; never a file path or web URL; an embedded image reads back as a marker, leave the key out to keep it), wallpaperMotion (moves a gradient or image only), backgroundBlur 0–1. Frame: aspectRatio ("auto", a preset, or an originalAspectRatios token; a fixed format picked for the first time fills the frame with a window that follows the cursor, which formatFollowCursor turns off when settingsContext.formatFill is "available"), padding 0–100 %, borderRadius 0–64 px, shadowIntensity 0–1, frame (none, window, laptop, phone, monitor) and frameTheme (light, dark), motionBlurAmount 0–1, depthOfField (blurs 3D-tilted zooms only). Camera: webcamLayoutPreset, webcamMirrored, webcamReactiveZoom (shrinks on zoom), webcamMaskShape (square or rectangle, the camera\'s own proportions; an untouched roundness follows it), webcamRoundness 0–1, webcamSizePreset 15–60, webcamAnchor (a corner or an edge middle), webcamCropRegion (the framing: a square share of the picture, width = height ≥ 1/3) and webcamCropPan (where that window sits, 0–1 per axis, 0.5 centred), webcamBackgroundMode (none, transparent, blur, custom: needs settingsContext.cameraSegmentation ready), webcamBlurIntensity 0–1, webcamWallpaper (as wallpaper). Cursor, under `cursor`: show, autoHide, theme (settingsContext.cursorThemes), asArrow (the recorded cursor kinds drawn as the arrow instead), size 1.5–6, smoothing 0–1, motionBlur 0–1, clickBounce 0–2, clickImpact, clickSound (only heard when the take recorded clicks) and clickSoundGainDb −24–0, model3d. Also autoFocusAll (every zoom follows the cursor) and audioGainDb −12–12 dB, the master volume. A value out of range or a key not listed is refused with the reason, and nothing changes. The result lists what was applied, including what the editor changes with it, and `inactive` for any of those the current state leaves without effect.',
+		'Change the project\'s look: pass only the settings to change, named as getCurrentDocument returns them under `settings`. Background: wallpaper (a bundled path from settingsContext.bundledWallpapers, a CSS colour or gradient, or a base64 PNG/JPEG data URL; never a file path or web URL; an embedded image reads back as a marker, leave the key out to keep it), wallpaperMotion (moves a gradient or image only), backgroundBlur 0–1. Frame: aspectRatio ("auto", a preset, or an originalAspectRatios token; a fixed format picked for the first time fills the frame with a window that follows the cursor, which formatFollowCursor turns off when settingsContext.formatFill is "available"), padding 0–100 %, borderRadius 0–64 px, shadowIntensity 0–1, frame (none, window, laptop, phone, monitor) and frameTheme (light, dark), motionBlurAmount 0–1, depthOfField (blurs 3D-tilted zooms only). Camera: webcamLayoutPreset, webcamMirrored, webcamReactiveZoom (shrinks on zoom), webcamMaskShape (square or rectangle, the camera\'s own proportions; an untouched roundness follows it), webcamRoundness 0–1, webcamSizePreset 15–60, webcamAnchor (a corner or an edge middle), webcamCropRegion (the framing: a square share of the picture, width = height ≥ 1/3) and webcamCropPan (where that window sits, 0–1 per axis, 0.5 centred), webcamBackgroundMode (none, transparent, blur, custom: needs settingsContext.cameraSegmentation ready), webcamBlurIntensity 0–1, webcamWallpaper (as wallpaper). Cursor, under `cursor`: show, autoHide, theme (settingsContext.cursorThemes), asArrow (the recorded cursor kinds drawn as the arrow instead), size 1.5–6, smoothing 0–1, motionBlur 0–1, clickBounce 0–2, clickImpact, clickSound (only heard when the take recorded clicks) and clickSoundGainDb −24–0, model3d. Also autoFocusAll (every zoom follows the cursor), audioGainDb −12–12 dB, the master volume, and recordingMuted (silences the recording\'s own sound in the preview and the export; added audio tracks still play). A value out of range or a key not listed is refused with the reason, and nothing changes. The result lists what was applied, including what the editor changes with it, and `inactive` for any of those the current state leaves without effect.',
 	addEffect:
 		"Write a visual effect as a shader and pose it over a span of the edited timeline (virtual seconds), or pose one of this project's effects again (effectId). Use it for a look the settings do not offer. `effect.code` is WGSL that defines `fn effect(uv: vec2<f32>) -> vec4<f32>`, called for every pixel; uv is 0..1 with (0,0) top-left. Available inside it: `frame(uv)` samples the composed picture; `footage(p)` samples the recording itself at its own resolution at point p of its surface (the space of `fx_to_footage`), transparent outside 0..1, with no cursor or webcam on it: read it for anything that magnifies, frame() for the rest; `params.<name>` reads each declared parameter; `ctx.time` is programme seconds; `ctx.region.x` goes 0 to 1 across the region (y its length in s, z seconds since it began); `ctx.resolution` and `ctx.aspect`; `ctx.cursor` (xy in uv, z = 1 when on screen); `ctx.clicks[0..3]`, the last four clicks, newest first (xy in uv where it happened, z seconds since, w = 1 when the slot holds one); `ctx.footage` and `ctx.camera`, the recording's and the webcam's rects (x, y, w, h in uv; camera zero-sized when absent) — all already placed through zoom and layout; `fx_to_footage(uv)` and `fx_from_footage(p)` map between output uv and the recording's own surface (0..1 across the recording) through the warp the compositor draws it with, zoom, layout and 3D camera included, and `ctx.footage_aspect` is its width over height: the effect works in whichever of the two spaces fits it; `fx_px(n)`, n pixels of a 1080p frame as a fraction of the height; `fx_hash(vec2<u32>)`, a random number in [0,1) identical on every GPU. Rules: the effect is a pure function of those inputs (no state between frames), so the preview and the export show the same pixels; reason in uv or fx_px, never raw pixels; every loop is a `for` with literal bounds (`for (var i = 0; i < 16; i++)`), at most 4096 iterations per pixel — the one hard rule. `params` declares up to 8 (recommended) parameters, each `{type: number|toggle|color|point, name, label, default}` (number also `min`, `max`); declare one only when moving it visibly changes the effect over its whole range. `target`: `image` (default: the picture under the annotations and captions), `text` (the annotations and captions alone, premultiplied alpha), `both` (everything); use text or both only when asked. One effect runs at a time: to combine two looks, write them in one shader. The result gives the cost tier, in frame() and footage() reads per pixel, with what a 1080p frame pays on a fast discrete GPU (RTX 4070 Ti) and on an integrated one (Apple M1): light ≤ 8, up to 0.06 ms and 1.3 ms; medium ≤ 32, 0.14 ms and 4.3 ms; heavy ≤ 128, 0.54 ms and 16 ms; very heavy beyond, 2 ms and 49 ms at 512 reads. It also gives a recommendation when the tier runs long: light anywhere, medium up to a minute, heavy up to 10 s, very heavy a few seconds. It is a recommendation, never a refusal. Code that does not compile is refused with the compiler's error at the line of your code: fix it and call again. Check the result with getFrames.",
 	setEffect:
@@ -381,18 +393,45 @@ function documentTool<S extends z.ZodType>(
 	inTurn: TurnQueue,
 ) {
 	return tool(
-		(args: z.infer<S>) =>
+		(args: z.infer<S>, config?: ToolRunnableConfig) =>
 			inTurn(async () => {
 				runtime.signal?.throwIfAborted();
+				const step = toolExecutionStep(name, args);
+				step.id = config?.toolCall?.id ?? step.id;
+				sink.executionStep?.(step);
 				sink.toolStart(name, args);
-				const execution = await runDocumentTool(holder.current, name, args, editsAllowed, runtime);
-				runtime.signal?.throwIfAborted();
-				if (execution.document) {
-					holder.current = execution.document;
-					sink.document?.(execution.document);
+				try {
+					const execution = await runDocumentTool(
+						holder.current,
+						name,
+						args,
+						editsAllowed,
+						runtime,
+					);
+					runtime.signal?.throwIfAborted();
+					if (execution.document) {
+						holder.current = execution.document;
+						sink.document?.(execution.document);
+					}
+					sink.toolEnd(name, execution.ok, execution.summary);
+					sink.executionStep?.({
+						...step,
+						status: execution.ok ? "succeeded" : "failed",
+						durationMs: Math.max(0, Date.now() - step.startedAt),
+						summary: executionSummary(execution),
+					});
+					return execution.resultJson;
+				} catch (error) {
+					sink.executionStep?.({
+						...step,
+						status: runtime.signal?.aborted ? "stopped" : "failed",
+						durationMs: Math.max(0, Date.now() - step.startedAt),
+						summary: runtime.signal?.aborted
+							? undefined
+							: executionText(error instanceof Error ? error.message : String(error)),
+					});
+					throw error;
 				}
-				sink.toolEnd(name, execution.ok, execution.summary);
-				return execution.resultJson;
 			}),
 		{ name, description: TOOL_DESCRIPTIONS[name], schema },
 	);
@@ -681,8 +720,19 @@ export async function probeCursorTelemetry(
  */
 const SILENT_TOOL_EVENTS: ReadonlySet<string> = new Set(["on_tool_start", "on_tool_end"]);
 
+/**
+ * The text one stream chunk adds to the turn. A turn is several model calls, one per round of
+ * tool results, and their texts used to be glued: "…transcript first.Transcript read: …", or a
+ * list item run into the sentence before it. The first text of each later call starts a new
+ * paragraph.
+ */
+export function modelCallText(turnText: string, delta: string, startsCall: boolean): string {
+	return startsCall && turnText.trim() && !turnText.endsWith("\n\n") ? `\n\n${delta}` : delta;
+}
+
 export interface InvokeResult {
 	cancelled?: boolean;
+	usage: AgentTurnUsage;
 	text: string;
 	document: AxcutDocument;
 	mutated: boolean;
@@ -696,11 +746,14 @@ export interface InvokeResult {
 export async function invokeOpenScreenAgent(args: InvokeArgs): Promise<InvokeResult> {
 	const { document, model, history, userMessage, sink } = args;
 	const editsAllowed = args.editsAllowed !== false;
+	const toolExecutions = createToolExecutionObserver((step) => sink.executionStep?.(step));
 	const lifetime = new AbortController();
 	const signal = args.signal ? AbortSignal.any([args.signal, lifetime.signal]) : lifetime.signal;
 	let finalText = "";
+	let callHasText = false;
 	let chatModelChunks: unknown[] = [];
 
+	const usage = createTurnUsageAccumulator();
 	const holder: DocumentHolder = { current: document };
 	const initialDocumentJSON = JSON.stringify(document);
 
@@ -712,13 +765,18 @@ export async function invokeOpenScreenAgent(args: InvokeArgs): Promise<InvokeRes
 		signal.throwIfAborted();
 		const chatModel = await abortable(createOpenScreenChatModel(model), signal);
 		const availableByAssetId = await abortable(probeCursorTelemetry(document, args.cursor), signal);
-		const tools = buildTools(holder, sink, editsAllowed, {
-			signal,
-			cursor: args.cursor,
-			availableByAssetId,
-			cameraSegmentation: args.cameraSegmentation,
-			checkShaderEffect: args.checkShaderEffect,
-		});
+		const tools = buildTools(
+			holder,
+			{ ...sink, executionStep: toolExecutions.publish },
+			editsAllowed,
+			{
+				signal,
+				cursor: args.cursor,
+				availableByAssetId,
+				cameraSegmentation: args.cameraSegmentation,
+				checkShaderEffect: args.checkShaderEffect,
+			},
+		);
 		const agent = createAgent({
 			signal,
 			model: chatModel,
@@ -753,10 +811,34 @@ export async function invokeOpenScreenAgent(args: InvokeArgs): Promise<InvokeRes
 			signal.throwIfAborted();
 			if (next.done) break;
 			const event = next.value;
+			usage.observe(event);
+			if (event.event === "on_chat_model_end" || event.event === "on_chat_model_error") {
+				sink.usage?.(usage.snapshot());
+			}
 			const eventType = typeof event.event === "string" ? event.event : "";
 			const data = event.data as Record<string, unknown> | undefined;
 			const name = typeof event.name === "string" ? (event.name as string) : "";
 
+			if (eventType === "on_chat_model_start") {
+				toolExecutions.reset();
+				callHasText = false;
+			}
+			if (eventType === "on_chat_model_end") {
+				const output = data?.output as
+					| { tool_calls?: Array<{ id?: string; name: string; args: unknown }> }
+					| undefined;
+				for (const call of output?.tool_calls ?? [])
+					if (call.id) toolExecutions.begin(call.id, call.name, call.args);
+			}
+			if (eventType === "on_chain_end") {
+				const output = data?.output as
+					| { messages?: Array<{ tool_call_id?: string; status?: string; content?: unknown }> }
+					| undefined;
+				// The SDK omits status on schema errors. Successful document tools already emitted a terminal verdict.
+				for (const message of output?.messages ?? [])
+					if (message.tool_call_id)
+						toolExecutions.result(message.tool_call_id, messageContentToText(message.content));
+			}
 			if (eventType === "on_chat_model_stream") {
 				const chunk = data?.chunk as Record<string, unknown> | undefined;
 				if (chunk) chatModelChunks.push(chunk);
@@ -767,8 +849,10 @@ export async function invokeOpenScreenAgent(args: InvokeArgs): Promise<InvokeRes
 				}
 				const delta = messageContentToText(content);
 				if (delta) {
-					sink.text(delta);
-					finalText += delta;
+					const text = modelCallText(finalText, delta, !callHasText);
+					callHasText = true;
+					sink.text(text);
+					finalText += text;
 				}
 			} else if (eventType === "on_tool_error") {
 				// Kept as a safety net rather than as a live path. `executeAgentTool`
@@ -805,16 +889,17 @@ export async function invokeOpenScreenAgent(args: InvokeArgs): Promise<InvokeRes
 					.map((e) => e.event)
 					.join(",")}). Last chunk: ${sample}`;
 			sink.error(reason);
-			return { text: "", document: holder.current, mutated, reason };
+			return { text: "", document: holder.current, mutated, reason, usage: usage.snapshot() };
 		}
-		return { text: finalText.trim(), document: holder.current, mutated };
+		return { text: finalText, document: holder.current, mutated, usage: usage.snapshot() };
 	} catch (err) {
 		if (args.signal?.aborted) {
 			return {
-				text: finalText.trim(),
+				text: finalText,
 				document: holder.current,
 				mutated: JSON.stringify(holder.current) !== initialDocumentJSON,
 				cancelled: true,
+				usage: usage.snapshot(),
 			};
 		}
 		// ponytail: surface the LangChain/HTTP error (with name + truncated
@@ -839,6 +924,7 @@ export async function invokeOpenScreenAgent(args: InvokeArgs): Promise<InvokeRes
 			document: holder.current,
 			mutated: JSON.stringify(holder.current) !== initialDocumentJSON,
 			reason,
+			usage: usage.snapshot(),
 		};
 	} finally {
 		// Seal queued/in-flight tools on every exit, including normal completion.

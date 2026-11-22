@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { projectRawTimelineSecToPlayback } from "@/lib/ai-edition/document/timeline";
 import type { AxcutAudioTrack, AxcutClip, AxcutTrimRange } from "@/lib/ai-edition/schema";
+import { removedHeadSec, removedRawSpans } from "@/lib/ai-edition/timeline/programme-time";
 import {
 	applyPreviewAudioSettings,
 	MUSIC_DUCK,
@@ -112,13 +113,24 @@ describe("applyPreviewAudioSettings", () => {
 		expect(element.volume).toBe(1);
 	});
 
-	it("leaves the elements alone once the graph is carrying the gain", () => {
-		// Their audio no longer reaches the default output, so `volume` would only
-		// scale the signal a second time on its way into the node.
+	it("silences a muted recording on its own gain, leaving the output gain to the tracks (#1104)", () => {
 		const graph = fakeGraph();
-		const element = { volume: 0.25 } as HTMLAudioElement;
-		applyPreviewAudioSettings(graph, [element], -6.0206);
-		expect(element.volume).toBe(0.25);
+		applyPreviewAudioSettings(graph, [], 0, Number.NEGATIVE_INFINITY);
+		expect(graph.voice.gain.value).toBe(0);
+		expect(graph.gain.gain.value).toBe(1);
+		const element = { volume: 1 } as HTMLAudioElement;
+		applyPreviewAudioSettings(null, [element], 0, Number.NEGATIVE_INFINITY);
+		expect(element.volume).toBe(0);
+	});
+
+	it("resets the elements to unity once the graph is carrying the gain", () => {
+		// Their audio no longer reaches the default output, so `volume` would only
+		// scale the signal a second time on its way into the node: a recording opened
+		// muted (volume 0 before the graph existed) would stay silent once unmuted.
+		const graph = fakeGraph();
+		const element = { volume: 0 } as HTMLAudioElement;
+		applyPreviewAudioSettings(graph, [element, null], -6.0206);
+		expect(element.volume).toBe(1);
 		expect(graph.gain.gain.value).toBeCloseTo(0.5, 4);
 	});
 
@@ -370,6 +382,31 @@ describe("resolveTimelineAudioPlayback under a trim", () => {
 		expect(
 			resolveTimelineAudioPlayback(outStart + 6.1, outStart, crossing, outSpan).shouldPlay,
 		).toBe(false);
+	});
+
+	// Issue #1522: what a cut takes off a bed's head is gone with the video; a cut further in
+	// is played through.
+	const removed = removedRawSpans([clip], [trim]);
+	const playAt = (t: AxcutAudioTrack, rawSec: number) => {
+		const outStart = project(t.startMs / 1000);
+		const outSpan = project(t.endMs / 1000) - outStart;
+		const head = removedHeadSec(removed, t.startMs / 1000);
+		return resolveTimelineAudioPlayback(project(rawSec), outStart, t, outSpan, head);
+	};
+
+	it("skips the head of a bed that starts inside a cut, so it stays on the film", () => {
+		const headCut = { ...buried, id: "head", startMs: 6000, endMs: 12_000 };
+		expect(removedHeadSec(removed, 6)).toBe(2);
+		// Raw 10 is 4s after the bed's head on the ruler: 4s of file, as before the cut.
+		expect(playAt(headCut, 10)).toEqual({ targetTimeSec: 4, shouldPlay: true });
+		expect(playAt({ ...headCut, loop: true, durationSec: 3 }, 10).targetTimeSec).toBeCloseTo(1, 6);
+	});
+
+	it("plays a bed through a cut inside it", () => {
+		const crossing = { ...buried, id: "crossing", startMs: 2000, endMs: 12_000 };
+		expect(removedHeadSec(removed, 2)).toBe(0);
+		// Raw 9 is output 5, 3s into the bed: 3s of file, the cut's 4s not skipped.
+		expect(playAt(crossing, 9)).toEqual({ targetTimeSec: 3, shouldPlay: true });
 	});
 });
 

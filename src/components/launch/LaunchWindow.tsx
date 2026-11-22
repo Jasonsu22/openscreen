@@ -8,6 +8,7 @@ import { nativeBridgeClient } from "@/native";
 import { canRecordMicrophone, getPlatform } from "@/utils/platformUtils";
 import { type CameraDevice } from "../../hooks/useCameraDevices";
 import { useCameraHudSync } from "../../hooks/useCameraHudSync";
+import { useFloatingCameraPreview } from "../../hooks/useFloatingCameraPreview";
 import {
 	isPlaceholderMicrophoneLabel,
 	type MicrophoneDevice,
@@ -16,11 +17,13 @@ import {
 import { usePortalOwnsSource } from "../../hooks/usePortalOwnsSource";
 import { useRememberedSourceName } from "../../hooks/useRememberedSourceName";
 import { useScreenRecorder } from "../../hooks/useScreenRecorder";
+import { useUpdateBadge } from "../../hooks/useUpdateBadge";
 import type { WebcamQualityId } from "../../hooks/webcamCaptureTarget";
 import { requestCameraAccess } from "../../lib/requestCameraAccess";
 import { Toaster } from "../ui/sonner";
 import {
 	HudCameraButton,
+	HudCameraPreviewButton,
 	HudCursorButton,
 	HudDivider,
 	HudDragHandle,
@@ -37,6 +40,7 @@ import {
 	HudStudioButton,
 	HudSystemAudioButton,
 	HudTrayLayoutButton,
+	HudUpdateButton,
 	HudWindowControls,
 } from "./HudControls";
 import { HudDeviceSettings, type HudDeviceSettingsLabels } from "./HudDeviceSettings";
@@ -44,21 +48,28 @@ import {
 	addHudToastsToStack,
 	computeHudAvailableHeight,
 	computeHudBarMaxHeight,
+	computeHudLinuxStack,
 	computeHudModalMaxHeight,
 	computeHudPopoverMaxHeight,
 	computeHudToastBottom,
 	computeHudToastsHeight,
 	computeHudWindowSize,
 	HUD_BAR_BOTTOM,
-	HUD_GROWTH_RESERVE,
 	HUD_POPOVER_GAP,
 	HUD_STACK_GAP,
+	hudGrowthReserve,
 } from "./hudGeometry";
 import styles from "./LaunchWindow.module.css";
 
 // Locale list is computed once at module load; keeping the reference stable lets
 // the language menu sit behind a memo boundary.
 const AVAILABLE_LOCALES = getAvailableLocales();
+
+// Set by the main process when Chromium draws through Wayland, where the HUD cannot move its
+// own window: see computeHudLinuxStack.
+const IS_WAYLAND_HUD =
+	typeof window !== "undefined" &&
+	new URLSearchParams(window.location.search).get("hudWayland") === "1";
 
 // Used only when the renderer can't see a real display (tests, headless).
 const FALLBACK_SCREEN_HEIGHT = 1080;
@@ -88,6 +99,12 @@ export function LaunchWindow() {
 	const tCommon = useScopedT("common");
 	// The microphone check's toast is worded where the camera check's is: in `editor`.
 	const tEditor = useScopedT("editor");
+	const updateBadge = useUpdateBadge();
+	const applyUpdate = useCallback(() => {
+		void window.electronAPI?.applyUpdate?.().catch(() => {
+			// The main process logs and reports its own failures.
+		});
+	}, []);
 	const {
 		locale,
 		setLocale,
@@ -104,6 +121,7 @@ export function LaunchWindow() {
 	const languageCode = locale.split("-")[0].toUpperCase();
 
 	const {
+		webcamPreviewStream,
 		recording,
 		paused,
 		saving,
@@ -131,12 +149,21 @@ export function LaunchWindow() {
 		setWebcamDeviceName,
 		cursorCaptureMode,
 		setCursorCaptureMode,
+		presenterOverlay,
 		softwareEncoderFallbackNoticeVisible,
 		dismissSoftwareEncoderFallbackNotice,
 		recordingPrefsLoaded,
 	} = useScreenRecorder();
 
 	// Choosing a device and switching one on are deliberately separate concerns.
+	const cameraPreview = useFloatingCameraPreview(
+		webcamPreviewStream,
+		webcamEnabled && !saving,
+		recording && getPlatform() === "win32",
+	);
+	const cameraPreviewShown =
+		webcamEnabled && !saving && cameraPreview.available && cameraPreview.visible;
+
 	// The mic and camera buttons are plain on/off toggles that use whatever device
 	// is currently selected (the system default until the user says otherwise);
 	// picking a different device — and checking it actually works — happens in the
@@ -382,9 +409,12 @@ export function LaunchWindow() {
 	// made the HUD flicker and jump the first few times each popover was opened.
 	//
 	// Two rules break it, and both live here:
-	//   1. Only the bar is measured. Everything floating above it has a fixed
-	//      width and a capped height, so its space is *reserved* from the first
-	//      frame — opening a popover costs zero native resizes.
+	//   1. On macOS and Windows, only the bar is measured. Everything floating
+	//      above it has a fixed width and a capped height, so its space is
+	//      *reserved* from the first frame — opening a popover costs zero native
+	//      resizes. On Linux, where the growth reserve is dropped to avoid
+	//      intercepting clicks, the anchor height drives the window size and
+	//      content height changes can resize it.
 	//   2. No measured box may be sized against the viewport. Caps come from
 	//      screen.availHeight (which a window resize can't change) and are pushed
 	//      down as CSS custom properties.
@@ -427,43 +457,68 @@ export function LaunchWindow() {
 			: 0;
 
 		// The two floating surfaces get their own CSS caps (a 470px-tall language
-		// list would look absurd), but the *window* always reserves room for the
-		// taller of them. Sizing the reserve to whichever happens to be open would
-		// mean the window grows when the panel opens — and since the stack is
-		// bottom-anchored, growing upward moves every bit of content down in window
+		// list would look absurd). On Windows and macOS the *window* always reserves
+		// room for the taller of them: sizing the reserve to whichever happens to be
+		// open would mean the window grows when the panel opens — and since the stack
+		// is bottom-anchored, growing upward moves every bit of content down in window
 		// coordinates, which the renderer repaints a frame or two after the native
-		// resize lands. That gap is visible as exactly the position judder this
-		// whole architecture exists to remove. So: reserve the maximum, always.
+		// resize lands. That gap is visible as exactly the position judder this whole
+		// architecture exists to remove. Linux cannot afford that reserve: its HUD is
+		// not click-through, so the empty space intercepts desktop clicks whenever no
+		// panel is open. There the window follows the measured stack instead.
 		const popoverMaxHeight = computeHudPopoverMaxHeight(barHeight, availableHeight);
 		const modalMaxHeight = computeHudModalMaxHeight(barHeight, availableHeight);
 		const anchorEl = hudAnchorRef.current;
 		anchorEl?.style.setProperty("--hud-popover-max-h", `${popoverMaxHeight}px`);
 		anchorEl?.style.setProperty("--hud-modal-max-h", `${modalMaxHeight}px`);
 
+		// Measured after the caps above are applied: the anchor is the whole stack,
+		// bar plus whatever is open above it, so its height is exactly the content
+		// that has to be on screen right now.
+		const anchorRect = anchorEl?.getBoundingClientRect();
+		const stackRect = anchorRect?.width && anchorRect.height ? anchorRect : barRect;
+		const stackHeight = stackRect.height || barHeight;
+
+		const platform = getPlatform();
+		const isLinux = platform === "linux";
+		const growthReserve = hudGrowthReserve(platform);
+		const toastsHeight = hudToastsHeightRef.current;
+		const linuxStack = computeHudLinuxStack({
+			wayland: IS_WAYLAND_HUD,
+			openStackHeight: stackHeight - barHeight,
+			toastsHeight,
+			reserveHeight: HUD_POPOVER_GAP + Math.max(popoverMaxHeight, modalMaxHeight),
+		});
 		const { required, granted } = computeHudWindowSize({
 			barWidth,
 			barHeight,
-			noticeHeight,
+			// On Linux the measured stack already contains any notice, so counting the
+			// notice again would reserve its height twice.
+			noticeHeight: isLinux ? 0 : noticeHeight,
 			availableHeight,
 			stackMaxHeight: Math.max(popoverMaxHeight, modalMaxHeight),
+			openStackHeight: isLinux ? linuxStack.openStackHeight : undefined,
+			toastsHeight: isLinux ? linuxStack.toastsHeight : toastsHeight,
+			growthReserve,
 		});
 
 		const allocated = hudAllocatedSizeRef.current;
 		// A different orientation is a different shape entirely (wide-short vs
 		// narrow-tall), so the previous allocation says nothing useful.
 		const orientationChanged = allocated.orientation !== trayLayout;
-		// Grow the moment the content stops fitting. Shrink only once the content
-		// has fallen a whole reserve below what was granted — that asymmetry is the
-		// hysteresis: the bar can grow into its reserve (recording controls, a
-		// longer source name) and back out again without a single native resize,
-		// while a one-off bad reading (an unstyled first paint in dev, say) can't
-		// leave the overlay permanently oversized.
+		// Grow the moment the content stops fitting. On Windows and macOS shrink only
+		// once the content has fallen a whole reserve below what was granted — that
+		// asymmetry is the hysteresis: the bar can grow into its reserve (recording
+		// controls, a longer source name) and back out again without a single native
+		// resize, while a one-off bad reading (an unstyled first paint in dev, say)
+		// can't leave the overlay permanently oversized. Linux has no reserve to fall
+		// back into, so it resizes symmetrically and never keeps dead space.
 		const needsResize =
 			orientationChanged ||
 			required.width > allocated.width ||
 			required.height > allocated.height ||
-			granted.width + HUD_GROWTH_RESERVE < allocated.width ||
-			granted.height + HUD_GROWTH_RESERVE < allocated.height;
+			granted.width + growthReserve < allocated.width ||
+			granted.height + growthReserve < allocated.height;
 
 		// The main process keeps this rect on screen, not the window: the window is
 		// mostly transparent reserve, and clamping it would strand the bar at the
@@ -473,15 +528,14 @@ export function LaunchWindow() {
 		// and since the stack is centred and pinned HUD_BAR_BOTTOM above the window's
 		// bottom edge (LaunchWindow.module.css), the rect the granted size will
 		// produce is computed exactly rather than measured a frame late.
-		const anchorRect = anchorEl?.getBoundingClientRect();
-		const stackRect = anchorRect?.width && anchorRect.height ? anchorRect : barRect;
-		const stackHeight = stackRect.height || barHeight;
 		// Toasts sit above the stack, and they are just as visible: a toast pushed off the top
 		// of the screen is an error nobody reads.
-		setHudToastBottom(computeHudToastBottom(stackHeight));
+		setHudToastBottom(
+			computeHudToastBottom(isLinux ? barHeight + linuxStack.toastLift : stackHeight),
+		);
 		const visible = addHudToastsToStack(
 			{ width: stackRect.width || barWidth, height: stackHeight },
-			hudToastsHeightRef.current,
+			toastsHeight,
 		);
 		const contentFor = (size: { width: number; height: number }) => ({
 			x: (size.width - visible.width) / 2,
@@ -520,9 +574,10 @@ export function LaunchWindow() {
 	}, [trayLayout]);
 
 	// One persistent observer; elements wire themselves up via callback refs as
-	// they mount/unmount. The bar and the notice column size the window; the anchor
-	// (the whole stack) only feeds the content rect, so a popover opening costs a
-	// re-clamp but never a native resize.
+	// they mount/unmount. On Windows and macOS, the bar and the notice column size
+	// the window; the anchor only feeds the content rect, so a popover opening
+	// costs zero native resizes. On Linux, the anchor height drives window size
+	// and content height changes can resize it.
 	const hudResizeObserverRef = useRef<ResizeObserver | null>(null);
 	useEffect(() => {
 		const observer = new ResizeObserver(() => measureHudSize());
@@ -1172,7 +1227,11 @@ export function LaunchWindow() {
 
 	const versionLabel = appInfo ? t("deviceSettings.version", { version: appInfo.version }) : null;
 
-	const hasNotices = Boolean(systemLocaleSuggestion) || softwareEncoderFallbackNoticeVisible;
+	const showPresenterOverlayWarning = Boolean(recording && presenterOverlay?.cameraInterrupted);
+	const hasNotices =
+		Boolean(systemLocaleSuggestion) ||
+		softwareEncoderFallbackNoticeVisible ||
+		showPresenterOverlayWarning;
 
 	return (
 		// Avoid w-screen/h-screen: 100vw can exceed the inner layout width when scrollbars
@@ -1279,6 +1338,15 @@ export function LaunchWindow() {
 								tooltip={t("tooltips.camera")}
 								onClick={toggleWebcam}
 							/>
+							{/* A Linux monitor take cannot exclude the preview: hide the control, not grey it out. */}
+							{cameraPreview.supported && webcamEnabled && cameraPreview.available && (
+								<HudCameraPreviewButton
+									visible={cameraPreviewShown}
+									disabled={saving}
+									label={t(cameraPreviewShown ? "floatingCamera.hide" : "floatingCamera.show")}
+									onClick={cameraPreview.toggle}
+								/>
+							)}
 							<HudSettingsButton
 								buttonRef={settingsTriggerRef}
 								locked={controlsLocked}
@@ -1336,13 +1404,7 @@ export function LaunchWindow() {
 							/>
 						)}
 
-						{!isLinuxHud && (
-							<HudNotesButton
-								disabled={saving}
-								label={t("tooltips.openNotes")}
-								onClick={openNotes}
-							/>
-						)}
+						<HudNotesButton disabled={saving} label={t("tooltips.openNotes")} onClick={openNotes} />
 
 						<HudDivider vertical={isVertical} />
 
@@ -1350,6 +1412,14 @@ export function LaunchWindow() {
 						<div
 							className={`flex items-center gap-[5px] ${isVertical ? "flex-col" : ""} ${styles.electronNoDrag}`}
 						>
+							{/* Hidden mid-take: an update cannot install during one anyway. */}
+							{updateBadge && !recording && (
+								<HudUpdateButton
+									label={tCommon("actions.updateTo", { version: updateBadge.version })}
+									onClick={applyUpdate}
+								/>
+							)}
+
 							<HudLanguageButton
 								buttonRef={languageTriggerRef}
 								vertical={isVertical}
@@ -1422,6 +1492,21 @@ export function LaunchWindow() {
 								data-testid="hud-notice-column"
 								className={styles.hudNoticeColumn}
 							>
+								{showPresenterOverlayWarning && (
+									<div
+										role="alert"
+										data-hud-interactive="true"
+										data-testid="presenter-overlay-notice"
+										className={`${styles.hudNotice} w-full p-3 ${styles.electronNoDrag}`}
+									>
+										<div className="text-[14px] font-semibold text-amber-300">
+											{tCommon("presenterOverlay.interruptedTitle")}
+										</div>
+										<div className="mt-1 text-[12.5px] leading-relaxed text-white/75">
+											{tCommon("presenterOverlay.interruptedDescription")}
+										</div>
+									</div>
+								)}
 								{systemLocaleSuggestion && (
 									<HudNotice
 										title={t("systemLanguagePrompt.title")}
@@ -1434,6 +1519,7 @@ export function LaunchWindow() {
 										})}
 										onDismiss={dismissSystemLocaleSuggestion}
 										onConfirm={acceptSystemLocaleSuggestion}
+										confirmOnEnter={!isPopoverOpen}
 									/>
 								)}
 

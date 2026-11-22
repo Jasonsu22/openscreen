@@ -36,13 +36,23 @@ describe("recording state routing", () => {
 		const setter = source.slice(source.indexOf("const setAppRecording"));
 		const body = setter.slice(0, setter.indexOf("};"));
 		expect(body).toContain("appRecording = recording");
-		expect(body).toContain("mcpAppRecorder.recordingChanged(recording)");
-		expect(body).toContain("onRecordingStateChange?.(recording, sourceName)");
+		expect(body).toContain("mcpAppRecorder.recordingChanged(recording, recordingId)");
+		expect(body).toContain("onRecordingStateChange?.(recording, sourceName, preparing)");
 	});
 
 	it.each(["windows", "mac", "linux"])("a native %s start and stop notify it", (platform) => {
 		expect(handlerBody(`start-native-${platform}-recording`)).toContain("setAppRecording(true");
 		expect(handlerBody(`stop-native-${platform}-recording`)).toContain("setAppRecording(false");
+	});
+
+	it("a take's outcome is accepted from the main window only, before anything else", () => {
+		const body = handlerBody("recording-outcome");
+		const guard = body.indexOf(
+			"if (event.sender !== getMainWindow()?.webContents) return { success: false };",
+		);
+		expect(guard).toBeGreaterThan(-1);
+		expect(guard).toBeLessThan(body.indexOf("recordingOutcomeSchema"));
+		expect(guard).toBeLessThan(body.indexOf("recordingCompletion."));
 	});
 
 	it("the browser path notifies it", () => {

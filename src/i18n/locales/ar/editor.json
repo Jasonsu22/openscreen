@@ -196,6 +196,7 @@
 		"exportFailedGeneric": "فشل التصدير.",
 		"writingFile": "جارٍ كتابة الملف...",
 		"renderingFrames": "جارٍ عرض الإطارات",
+		"renderingGif": "جارٍ تصدير ملف GIF",
 		"framesEta": "{{current}} / {{total}} إطار · الوقت المتبقي {{eta}} ثانية",
 		"preparingEncoder": "جارٍ تجهيز المرمّز...",
 		"close": "إغلاق",
@@ -322,7 +323,24 @@
 		"stop": "إيقاف",
 		"stopping": "جارٍ الإيقاف…",
 		"stopped": "أوقفت هذه الجولة. تم الاحتفاظ بالتعديلات المطبّقة.",
-		"stopFailed": "تعذّر إيقاف جولة الوكيل."
+		"stopFailed": "تعذّر إيقاف جولة الوكيل.",
+		"usageComplete": "{{tokens}} رمزًا",
+		"usagePartial": "{{tokens}} رمزًا معروفًا · غير مكتمل",
+		"usageUnavailable": "استخدام الرموز غير متاح",
+		"usageCoverage": "تم احتساب {{counted}} من {{calls}} استدعاءات للنموذج",
+		"usageInput": "الإدخال: {{tokens}}",
+		"usageOutput": "الإخراج: {{tokens}}",
+		"usageCachedInput": "إدخال التخزين المؤقت المُبلّغ عنه: {{tokens}}",
+		"usageCacheCreation": "إدخال إنشاء التخزين المؤقت المُبلّغ عنه: {{tokens}}",
+		"usageReasoning": "إخراج الاستدلال المُبلّغ عنه: {{tokens}}",
+		"executionSteps": "خطوات التنفيذ",
+		"stepStatus": {
+			"running": "قيد التشغيل",
+			"succeeded": "نجح",
+			"failed": "فشل",
+			"stopped": "متوقف"
+		},
+		"stepReasoning": "التفكير"
 	},
 	"newProjectDialog": {
 		"title": "مشروع جديد",
@@ -346,7 +364,15 @@
 		"openHint": "للفتح",
 		"browseFiles": "تصفح الملفات…",
 		"deleteProject": "حذف المشروع",
-		"confirmDelete": "هل تريد حذف هذا المشروع؟ سيتم الاحتفاظ بتسجيلاتك."
+		"confirmDelete": "هل تريد حذف هذا المشروع؟ سيتم الاحتفاظ بتسجيلاتك.",
+		"confirmDeleteProject": "هل تريد حذف هذا المشروع؟",
+		"alsoTrash": "نقل تسجيلاته أيضًا إلى سلة المهملات ({{size}})",
+		"alsoRecycle": "نقل تسجيلاته أيضًا إلى سلة المحذوفات ({{size}})",
+		"recordingsKeptFor": "يتم الاحتفاظ بالتسجيلات التي يستخدمها {{projects}}.",
+		"recordingsKeptUnreadable": "تعذّرت قراءة بعض المشاريع، لذا يتم الاحتفاظ بتسجيلات هذا المشروع.",
+		"trashFailed": "تعذّر نقل التسجيلات إلى سلة المهملات. هل تريد حذفها نهائيًا؟",
+		"recycleFailed": "تعذّر نقل التسجيلات إلى سلة المحذوفات. هل تريد حذفها نهائيًا؟",
+		"deletePermanently": "حذف نهائي"
 	},
 	"editClipDialog": {
 		"title": "تعديل المقطع",
@@ -357,6 +383,10 @@
 		"duration": "المدة النهائية",
 		"reset": "إعادة التعيين",
 		"apply": "تطبيق",
+		"rotation": "التدوير",
+		"rotationUpright": "0°",
+		"rotationTurned": "180°",
+		"rotationTip": "اقلب الصورة رأسًا على عقب، مثلًا لكاميرا مثبتة بشكل مقلوب",
 		"pickClipTitle": "اختر مقطعًا لتعديله",
 		"clipLabel": "المقطع {{index}}"
 	},

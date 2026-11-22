@@ -18,6 +18,7 @@ import {
 	shell,
 	systemPreferences,
 } from "electron";
+import { z } from "zod";
 import { DEFAULT_WEBCAM_QUALITY, type WebcamQualityId } from "../../src/hooks/webcamCaptureTarget";
 import {
 	type AxcutDocument,
@@ -26,13 +27,16 @@ import {
 } from "../../src/lib/ai-edition/schema";
 import type { CliSourcesResult } from "../../src/lib/cliContracts";
 import { pickRecordingSource } from "../../src/lib/cliSourcePick";
+import { desktopSourceTimeoutMessage } from "../../src/lib/desktopSourceTimeout";
 import {
+	type NativeLinuxCaptureSource,
 	type NativeLinuxRecordingRequest,
 	portalCursorMode,
 } from "../../src/lib/nativeLinuxRecording";
 import {
 	collectMacCaptureExcludedWindowIds,
 	type NativeMacRecordingRequest,
+	updateMacPresenterOverlayState,
 } from "../../src/lib/nativeMacRecording";
 import type { NativeWindowsRecordingRequest } from "../../src/lib/nativeWindowsRecording";
 import {
@@ -69,9 +73,13 @@ import { DocumentService } from "../ai-edition/document-service";
 import { LlmConfigStore } from "../ai-edition/llm-config-store";
 import { StylePresetService } from "../ai-edition/style-preset-service";
 import { AppSettingsStore } from "../app-settings";
+import { writeFileReplacing } from "../atomic-rename";
+import { bringToFront } from "../bringToFront";
+import { CameraPreviewController } from "../cameraPreview";
 import { createRunnerHost } from "../cli/runnerHost";
 import { hideCountdownOverlay } from "../countdownOverlay";
-import { isDiagnosticModeEnabled, mainLogBuffer } from "../diagnostics/main-log-buffer";
+import { isDiagnosticModeEnabled, mainLogFile } from "../diagnostics/main-log-file";
+import { createZip } from "../diagnostics/zip";
 import { mainT } from "../i18n";
 import { getInstallChannel } from "../install-channel";
 import {
@@ -88,6 +96,7 @@ import { McpController } from "../mcp/mcp-controller";
 import { McpSettingsStore } from "../mcp/mcp-settings-store";
 import { createMediaTools, type MediaToolDeps, type RecordRequest } from "../mcp/media-tools";
 import { createToolRunner, type McpToolDeps } from "../mcp/openscreen-mcp-server";
+import { RecordingCompletion } from "../mcp/recording-completion";
 import { type AudioPeaksResult, getAudioPeaks } from "../media/audioPeaks";
 import {
 	readCursorRecordingFile as readCursorRecordingFileFrom,
@@ -98,17 +107,26 @@ import { findMediaLinksByFingerprint, registerMediaLinks } from "../media/mediaL
 import { relinkProjectMedia } from "../media/projectMediaRelinker";
 import { showOpenDialogOver, showSaveDialogOver } from "../messageBox";
 import {
+	isPortalCancelled,
 	type LinuxCaptureSourceKind,
 	LinuxNativeCaptureSession,
 } from "../native-bridge/capture/linuxNativeCaptureSession";
-import { compactCursorTelemetryPauseRanges } from "../native-bridge/cursor/recording/cursorPauseRanges";
-import { createCursorRecordingSession } from "../native-bridge/cursor/recording/factory";
+import {
+	compactCursorTelemetryPauseRanges,
+	finalizeSampledCursorTelemetry,
+} from "../native-bridge/cursor/recording/cursorPauseRanges";
+import {
+	createCursorRecordingSession,
+	createX11PointerRecordingSession,
+	isX11PointerFallbackEnabled,
+} from "../native-bridge/cursor/recording/factory";
 import {
 	isMacCursorHelperUnavailable,
 	requestMacCursorAccessibilityAccess,
 } from "../native-bridge/cursor/recording/macNativeCursorRecordingSession";
-import { findPipeWireCursorHelperPath } from "../native-bridge/cursor/recording/pipeWireCursorRecordingSession";
+import { findLinuxCaptureHelperPath } from "../native-bridge/cursor/recording/pipeWireCursorRecordingSession";
 import type { CursorRecordingSession } from "../native-bridge/cursor/recording/session";
+import { resolveX11CaptureBounds } from "../native-bridge/cursor/recording/x11CaptureBounds";
 import { toHelperRect } from "../native-bridge/helperCoordinates";
 import {
 	isMacPickerSourceId,
@@ -124,7 +142,14 @@ import { getMacPermissions, showPermissionsWindow } from "../permissions";
 import { scoreDeviceNameMatch } from "../recording/deviceNameMatching";
 import { recordingStorageProblem } from "../recording/diskSpaceCheck";
 import {
+	linuxCaptureBackend,
+	linuxPortalOwnsSources,
+	resetLinuxCaptureBackendProbe,
+	resolveX11CaptureSource,
+} from "../recording/linuxCaptureBackend";
+import {
 	describeSalvagedTake,
+	formatDuration,
 	nativeMacSalvageTarget,
 	salvageNativeMacCapture,
 } from "../recording/nativeMacCaptureSalvage";
@@ -141,8 +166,11 @@ import {
 	readMicrophoneNotFound,
 	readMicrophoneUnavailable,
 	readSecondaryWindowsApplied,
+	readSoftwareEncoderAdapters,
+	readStalledEncoderAdapter,
 	readWebcamFormat,
 	readWebcamUnavailable,
+	rememberSoftwareEncoderAdapter,
 	terminateNativeWindowsCapture,
 	waitForNativeWindowsCaptureStop,
 } from "../recording/nativeWindowsCaptureStop";
@@ -161,7 +189,23 @@ import {
 	shouldPersistSelectedSource,
 } from "../recording-source-settings";
 import { getSttManager } from "../stt";
-import { createRunnerWindow } from "../windows";
+import { usesWaylandBackend } from "../wayland";
+import {
+	createCameraPreviewWindow,
+	createRunnerWindow,
+	getCameraPreviewWindow,
+	parkCameraPreviewWindow,
+	resizeCameraPreviewWindow,
+} from "../windows";
+import {
+	assertWindowsUpdateIdle,
+	isWindowsUpdatePending,
+	WINDOWS_UPDATE_PENDING_MESSAGE,
+} from "../windows-update";
+import {
+	createWindowsCameraPreviewMailbox,
+	watchWindowsCameraPreview,
+} from "../windowsCameraPreview";
 import { getSourcesByType, shouldEnumerateSourceTypesSeparately } from "./desktopSourceTypes";
 import { registerNativeBridgeHandlers } from "./nativeBridge";
 import { createNativeMacMidCaptureErrorWatch } from "./nativeMacMidCaptureErrorWatch";
@@ -185,6 +229,11 @@ const ALLOWED_IMPORT_VIDEO_EXTENSIONS = new Set([
 	".ts",
 ]);
 const PREVIEW_AUDIO_DIR = path.join(app.getPath("userData"), "preview-audio");
+/** Adapters whose hardware H.264 encoder stalled on stop (getopenscreen/openscreen#1544). */
+const WINDOWS_SOFTWARE_ENCODER_ADAPTERS_FILE = path.join(
+	app.getPath("userData"),
+	"windows-software-encoder-adapters.json",
+);
 // See the save-recorded-voiceover handler: an upper bound on renderer-supplied
 // bytes written to disk, well past any plausible take.
 const MAX_RECORDED_VOICEOVER_BYTES = 512 * 1024 * 1024;
@@ -872,11 +921,12 @@ const nativeMacCaptureExits = new WeakMap<ChildProcessWithoutNullStreams, Native
  */
 const nativeMacCaptureOutputs = new WeakMap<ChildProcessWithoutNullStreams, string>();
 /**
- * Why the last macOS take ended before it was stopped, keyed by the file it was
- * kept in. Handed to whatever opens that recording next — the editor or the CLI —
+ * What the user must hear about the last native take, keyed by the file it was kept
+ * in: why a macOS take ended before it was stopped, or that a Linux take lost its audio. Handed to whatever opens that recording next — the editor or the CLI —
  * because the HUD that ran the stop closes as the editor opens.
  */
-let nativeMacRecordingWarning: { screenVideoPath: string; message: string } | null = null;
+let nativeRecordingWarning: { screenVideoPath: string; message: string } | null = null;
+let nativeMacPresenterOverlay = { active: false, cameraInterrupted: false };
 /** True while stop-native-mac-recording runs: the take is ending on purpose. */
 let nativeMacStopInFlight = false;
 // Global frame the macOS cursor is normalised against (see getSelectedSourceBounds).
@@ -1137,6 +1187,19 @@ function isMacWindowCaptureSourceId(sourceId: string | null | undefined) {
 	);
 }
 
+// Electron pointer positions and display bounds are DIP; helper origins may
+// instead be X11 pixels. Resolve conservatively, never mix those coordinate spaces.
+// Only native Linux capture runs this sampler, so the portal grant is the source of truth.
+function getX11CaptureBounds() {
+	if (!linuxNativeCaptureSession) return null;
+	return resolveX11CaptureBounds({
+		displays: screen.getAllDisplays(),
+		sourceKind: linuxNativeCaptureSession.grantedSourceKind,
+		origin: linuxNativeCaptureSession.grantedCaptureOrigin,
+		size: linuxNativeCaptureSession.grantedCaptureSize,
+	});
+}
+
 function getSelectedSourceBounds() {
 	// A window take is normalised against the rect the helper is recording. That
 	// rect is seeded from the source frame before the first cursor sample and
@@ -1334,11 +1397,40 @@ async function resolveDirectShowWebcamClsid(deviceName?: string) {
 async function startCursorRecording(recordingId?: number) {
 	// On Linux the native capture helper already produces cursor samples, from
 	// the SAME portal session that produces the pixels. Spawning the cursor-only
-	// helper alongside it would open a SECOND portal session — and since
+	// PipeWire helper alongside it would open a SECOND portal session — and since
 	// SelectSources may be called once per session, that means a second picker
 	// in front of the user, for a stream nothing consumes. The double prompt is
 	// precisely what the native path exists to remove.
+	//
+	// X11 is the exception: the portal often has no METADATA cursor mode at all,
+	// so the helper records pixels with an empty cursor track. Sampling the
+	// pointer through X11 (Electron / xinput) does not talk to the portal,
+	// so it can run in parallel and fill `<video>.cursor.json` when native samples
+	// come back empty.
 	if (linuxNativeCaptureSession) {
+		if (!isX11PointerFallbackEnabled()) {
+			return;
+		}
+		if (cursorRecordingSession) {
+			pendingCursorRecordingData = await cursorRecordingSession.stop();
+			cursorRecordingSession = null;
+		}
+		pendingCursorRecordingData = null;
+		// Use the helper's capture-started epoch, not prepare/picker time or the
+		// slightly later sampler start: pause ranges use that same epoch.
+		cursorRecordingSession = createX11PointerRecordingSession({
+			getDisplayBounds: getX11CaptureBounds,
+			maxSamples: MAX_CURSOR_SAMPLES,
+			sampleIntervalMs: CURSOR_SAMPLE_INTERVAL_MS,
+			startTimeMs: linuxNativeCaptureSession.cursorStartTimeMs,
+		});
+		try {
+			await cursorRecordingSession.start();
+			console.info("[cursor-x11] sampling the pointer alongside native Linux capture");
+		} catch (error) {
+			console.error("Failed to start the X11 pointer sampler:", error);
+			cursorRecordingSession = null;
+		}
 		return;
 	}
 
@@ -1650,6 +1742,7 @@ function attachNativeMacCaptureOutputDrain(
 	proc: ChildProcessWithoutNullStreams,
 	onTakeEnded: () => void,
 	onSystemAudioUnavailable: () => void,
+	onPresenterOverlayChanged: (active: boolean) => void,
 ) {
 	let lineBuffer = "";
 	// Hooked here rather than on `nativeMacCaptureEvents`, which the start wait
@@ -1658,6 +1751,8 @@ function attachNativeMacCaptureOutputDrain(
 		() => nativeMacCaptureProcess === proc && !nativeMacStopInFlight,
 		onTakeEnded,
 		onSystemAudioUnavailable,
+		onPresenterOverlayChanged,
+		() => nativeMacCaptureProcess === proc,
 	);
 	const drain = (chunk: Buffer) => {
 		const text = chunk.toString();
@@ -1909,10 +2004,11 @@ async function resolveMediaLinksForVideo(videoPath: string): Promise<{
 }
 
 /**
- * Writes the diagnostic bundle a bug report needs: app/OS facts, the native
- * helpers' raw stdout/stderr (which is where `[stop-timing]` and
- * `encoder-selection` land — see nativeWindowsCaptureStop.ts), and the main
- * process's own recent console output. Shared by the renderer's IPC call and
+ * Writes the diagnostic bundle a bug report needs, as a `.zip`: `diagnostic.json` with
+ * app/OS facts, the native helpers' raw stdout/stderr (which is where `[stop-timing]` and
+ * `encoder-selection` land — see nativeWindowsCaptureStop.ts) and the tail of the main
+ * process's log, next to that log's files whole (`main.log`, and `main.old.log` once it
+ * has rotated), which reach back into earlier launches. Shared by the renderer's IPC call and
  * the menu/tray "Save Diagnostics" entry point in main.ts, which has no
  * renderer-side `projectState`/`logs` to offer and does not need to.
  */
@@ -1924,14 +2020,17 @@ export async function exportDiagnosticFile(payload: {
 }) {
 	const { filePath, canceled } = await dialog.showSaveDialog({
 		title: "Save Diagnostic File",
-		defaultPath: `openscreen-diagnostic-${Date.now()}.json`,
-		filters: [{ name: "JSON", extensions: ["json"] }],
+		defaultPath: `openscreen-diagnostic-${Date.now()}.zip`,
+		filters: [{ name: "ZIP", extensions: ["zip"] }],
 	});
 
 	if (canceled || !filePath) return { success: false, canceled: true };
 
 	const HELPER_OUTPUT_MAX_BYTES = 64 * 1024;
+	const MAIN_PROCESS_LOGS_MAX_BYTES = 256 * 1024;
 	const tail = (s: string, max: number) => (s.length <= max ? s : s.slice(s.length - max));
+	// Read before `logFileError` below, so a failed read is reported in the same bundle.
+	const logFiles = mainLogFile.readFiles();
 
 	const diagnostic = {
 		timestamp: new Date().toISOString(),
@@ -1957,11 +2056,14 @@ export async function exportDiagnosticFile(payload: {
 			mac: tail(nativeMacCaptureOutput, HELPER_OUTPUT_MAX_BYTES),
 			linux: tail(lastLinuxCaptureSession?.helperOutput ?? "", HELPER_OUTPUT_MAX_BYTES),
 		},
-		mainProcessLogs: mainLogBuffer.snapshot(),
+		mainProcessLogs: mainLogFile.readTail(MAIN_PROCESS_LOGS_MAX_BYTES),
+		logFile: mainLogFile.filePath,
+		logFileError: mainLogFile.lastError,
 	};
 
 	try {
-		await fs.writeFile(filePath, JSON.stringify(diagnostic, null, 2), "utf-8");
+		const json = Buffer.from(JSON.stringify(diagnostic, null, 2), "utf-8");
+		await fs.writeFile(filePath, createZip([{ name: "diagnostic.json", data: json }, ...logFiles]));
 		return { success: true, path: filePath };
 	} catch (error) {
 		console.error("Failed to write diagnostic file:", error);
@@ -1978,23 +2080,32 @@ export function registerIpcHandlers(
 	getSourceSelectorWindow: () => BrowserWindow | null,
 	getNotesWindow: () => BrowserWindow | null,
 	getCountdownOverlayWindow?: () => BrowserWindow | null,
-	onRecordingStateChange?: (recording: boolean, sourceName: string) => void,
+	onRecordingStateChange?: (recording: boolean, sourceName: string, preparing?: boolean) => void,
 	_switchToHud?: () => void,
 	/** The editor holds changes it has not saved (main.ts): an MCP take would close it. */
 	editorHasUnsavedChanges?: () => boolean,
 ) {
 	/** The HUD is recording a take, the user's or an MCP client's. Set by `setAppRecording` only. */
 	let appRecording = false;
+	const recordingCompletion = new RecordingCompletion();
 	/**
 	 * Every start and stop of a take goes through here: the browser path's `set-recording-state`
 	 * and the native paths, which start and stop in this process. The MCP recorder waits on it
 	 * for a client's take to start, and the tray shows it. A native path that called
 	 * `onRecordingStateChange` itself left the MCP recorder waiting on a take already running.
 	 */
-	const setAppRecording = (recording: boolean, sourceName: string) => {
+	const setAppRecording = (
+		recording: boolean,
+		sourceName: string,
+		recordingId?: number,
+		preparing = false,
+	) => {
+		if (recording && !preparing && recordingId !== undefined)
+			recordingCompletion.started(recordingId);
 		appRecording = recording;
-		mcpAppRecorder.recordingChanged(recording);
-		onRecordingStateChange?.(recording, sourceName);
+		if (!recording && !preparing) cameraPreview.setCaptureAllowed(true);
+		if (!preparing) mcpAppRecorder.recordingChanged(recording, recordingId);
+		onRecordingStateChange?.(recording, sourceName, preparing);
 	};
 	const appSettings = new AppSettingsStore(app.getPath("userData"));
 	const broadcastSelectedSource = (source: SelectedSource | null) => {
@@ -2045,8 +2156,7 @@ export function registerIpcHandlers(
 					shouldEnumerateSourceTypesSeparately(process.platform, process.env),
 				),
 				GET_SOURCES_TIMEOUT_MS,
-				`Desktop source enumeration did not return within ${GET_SOURCES_TIMEOUT_MS}ms. ` +
-					"This usually means the display or GPU stack cannot be reached — check that a display server is available.",
+				desktopSourceTimeoutMessage(GET_SOURCES_TIMEOUT_MS),
 			);
 		} catch (error) {
 			if (diagnostic) {
@@ -2085,7 +2195,13 @@ export function registerIpcHandlers(
 				appSettings.getSnapshot().lastSource,
 				process.platform,
 				sources,
-				{ waylandPortal: process.platform === "linux" && Boolean(findPipeWireCursorHelperPath()) },
+				{
+					waylandPortal: await linuxPortalOwnsSources(
+						process.platform,
+						findLinuxCaptureHelperPath(),
+						process.env,
+					),
+				},
 			);
 			if (restored) {
 				selectedSource = {
@@ -2160,7 +2276,8 @@ export function registerIpcHandlers(
 	 * pick would record them unless the picker is told to leave them out.
 	 */
 	function macPickerExcludedWindowIds() {
-		const appWindowSourceIds = [getMainWindow(), getNotesWindow()]
+		ensureMacCameraPreviewWindow();
+		const appWindowSourceIds = [getMainWindow(), getNotesWindow(), getCameraPreviewWindow()]
 			.filter((window): window is BrowserWindow => !!window && !window.isDestroyed())
 			.map((window) => window.getMediaSourceId());
 		return collectMacCaptureExcludedWindowIds(appWindowSourceIds);
@@ -2232,7 +2349,7 @@ export function registerIpcHandlers(
 
 	ipcMain.handle("get-selected-source", async () => {
 		const previousSelectedSource = selectedSource;
-		if (process.platform === "linux" && findPipeWireCursorHelperPath()) {
+		if (await linuxPortalOwnsSources(process.platform, findLinuxCaptureHelperPath(), process.env)) {
 			selectedSource = null;
 			selectedDesktopSource = null;
 			if (!sameSelectedSource(previousSelectedSource, null)) {
@@ -2338,6 +2455,9 @@ export function registerIpcHandlers(
 	// Asked before every take starts. A disk that fills up mid-take used to be found only
 	// when the take was saved, and the take was lost with it.
 	ipcMain.handle("check-recording-storage", async () => {
+		if (isWindowsUpdatePending()) {
+			return { success: false, error: WINDOWS_UPDATE_PENDING_MESSAGE };
+		}
 		const problem = await recordingStorageProblem(RECORDINGS_DIR);
 		if (!problem) return { success: true };
 		if (problem.kind === "unavailable") {
@@ -2446,8 +2566,15 @@ export function registerIpcHandlers(
 		return access;
 	});
 
+	/** The selection the direct X11 backend records; the portal path takes none. */
+	async function linuxX11Source(): Promise<{ source?: NativeLinuxCaptureSource }> {
+		const helperPath = findLinuxCaptureHelperPath();
+		if (!helperPath || (await linuxCaptureBackend(helperPath, process.env)) !== "x11") return {};
+		return { source: resolveX11CaptureSource(selectedSource, screen.getAllDisplays()) };
+	}
+
 	ipcMain.handle("open-source-selector", async () => {
-		// Nothing to open on Linux WHEN THE NATIVE HELPER IS THERE. The selector's
+		// Nothing to open on Wayland WHEN THE NATIVE HELPER IS THERE. The selector's
 		// own `desktopCapturer.getSources()` raises a portal dialog — a SECOND
 		// one, for a session that is thrown away — and whatever it returns cannot
 		// reach the helper, because `SelectSources` has no parameter naming a
@@ -2456,7 +2583,7 @@ export function registerIpcHandlers(
 		// Without the helper the recorder falls back to Chromium's capture, which
 		// DOES consume a source id, so the picker has to stay reachable there or
 		// that path could never start.
-		if (process.platform === "linux" && findPipeWireCursorHelperPath()) {
+		if (await linuxPortalOwnsSources(process.platform, findLinuxCaptureHelperPath(), process.env)) {
 			return { opened: false, reason: "portal-owns-selection" };
 		}
 
@@ -2489,10 +2616,62 @@ export function registerIpcHandlers(
 		return { opened: true };
 	});
 
+	const cameraPreview = new CameraPreviewController(
+		createCameraPreviewWindow,
+		resizeCameraPreviewWindow,
+		usesWaylandBackend(process.platform, app.commandLine, process.env)
+			? parkCameraPreviewWindow
+			: undefined,
+		(owner) => BrowserWindow.fromWebContents(owner),
+	);
+	// destroy() bypasses the preview close-to-hide handler during application shutdown.
+	app.on("before-quit", () => cameraPreview.dispose());
+	function ensureMacCameraPreviewWindow() {
+		const hud = getMainWindow();
+		if (
+			process.platform === "darwin" &&
+			hud &&
+			!hud.isDestroyed() &&
+			new URL(hud.webContents.getURL()).searchParams.get("windowType") === "hud-overlay"
+		) {
+			cameraPreview.ensure(hud.webContents);
+		}
+	}
+	ipcMain.handle("camera-preview:configure", (event, enabled: unknown, visible: unknown) => {
+		if (
+			event.sender !== getMainWindow()?.webContents ||
+			new URL(event.sender.getURL()).searchParams.get("windowType") !== "hud-overlay"
+		)
+			return;
+		cameraPreview.configure(event.sender, enabled === true, visible === true);
+	});
+	ipcMain.handle("camera-preview:prepare-capture", (event) => {
+		if (process.platform === "linux" && event.sender === getMainWindow()?.webContents) {
+			return cameraPreview.prepareCapture();
+		}
+	});
+	ipcMain.handle("camera-preview:restore-capture", (event, token: unknown) => {
+		if (
+			process.platform === "linux" &&
+			event.sender === getMainWindow()?.webContents &&
+			!appRecording &&
+			!linuxNativeCaptureSession
+		) {
+			cameraPreview.restoreCapture(token);
+		}
+	});
+	ipcMain.handle("camera-preview:frame", (event, jpeg: unknown, aspectRatio: unknown) =>
+		cameraPreview.frame(event.sender, jpeg, aspectRatio),
+	);
+	ipcMain.handle("camera-preview:hide", (event) => cameraPreview.hide(event.sender));
+	ipcMain.handle("camera-preview:resize", (event, diameter: unknown) =>
+		cameraPreview.resize(event.sender, diameter),
+	);
+
 	ipcMain.handle("open-notes", async () => {
-		const notesSelectorWin = getNotesWindow();
-		if (notesSelectorWin) {
-			notesSelectorWin.focus();
+		const notesWindow = getNotesWindow();
+		if (notesWindow) {
+			bringToFront(notesWindow);
 			return { opened: true };
 		}
 
@@ -2514,6 +2693,7 @@ export function registerIpcHandlers(
 
 	/** The editor's Record button: over to the HUD, which starts the take by itself. */
 	function startNewRecording() {
+		assertWindowsUpdateIdle();
 		_switchToHud?.();
 		const hudWindow = getMainWindow();
 		if (hudWindow && !hudWindow.isDestroyed()) {
@@ -2606,9 +2786,14 @@ export function registerIpcHandlers(
 			return { success: true, available: false, reason: "unsupported-platform" };
 		}
 
-		const helperPath = findPipeWireCursorHelperPath();
+		const helperPath = findLinuxCaptureHelperPath();
 		return helperPath
-			? { success: true, available: true, helperPath }
+			? {
+					success: true,
+					available: true,
+					helperPath,
+					backend: await linuxCaptureBackend(helperPath, process.env),
+				}
 			: { success: true, available: false, reason: "missing-helper" };
 	});
 
@@ -2634,8 +2819,15 @@ export function registerIpcHandlers(
 			preparingLinuxCaptureToken = token;
 
 			try {
-				if (!findPipeWireCursorHelperPath()) {
+				const helperPath = findLinuxCaptureHelperPath();
+				if (!helperPath) {
 					return { success: false, reason: "missing-helper" };
+				}
+				// A prepare only raises the portal's picker ahead of the countdown. Direct X11
+				// has none, and a helper spawned now would record the source selected now
+				// rather than the one selected when the take starts.
+				if ((await linuxCaptureBackend(helperPath, process.env)) === "x11") {
+					return { success: false, reason: "no-portal-picker" };
 				}
 				const recordingId =
 					typeof request?.recordingId === "number" && Number.isFinite(request.recordingId)
@@ -2667,6 +2859,7 @@ export function registerIpcHandlers(
 				});
 				lastLinuxCaptureSession = session;
 
+				cameraPreview.setCaptureAllowed(false);
 				await session.start();
 				// The picker is up now. No timeout: a human is reading a dialog.
 				await session.waitUntilSourceSelected();
@@ -2680,6 +2873,7 @@ export function registerIpcHandlers(
 				}
 				preparingLinuxCaptureToken = null;
 
+				cameraPreview.setCaptureAllowed(session.grantedSourceKind === "window");
 				preparedLinuxCapture = { session, outputPath, request };
 				return {
 					success: true,
@@ -2688,7 +2882,21 @@ export function registerIpcHandlers(
 				};
 			} catch (error) {
 				console.warn("Could not prepare the native Linux capture:", error);
-				discardPreparedLinuxCapture("prepare failed");
+				// The portal may have come or gone since the probe.
+				resetLinuxCaptureBackendProbe();
+				// A newer prepare or take owns the session and the preview suspension now:
+				// a stale failure must not discard the one or lift the other.
+				const superseded =
+					(preparingLinuxCaptureToken !== null && preparingLinuxCaptureToken !== token) ||
+					preparedLinuxCapture !== null ||
+					linuxNativeCaptureSession !== null;
+				if (!superseded) {
+					discardPreparedLinuxCapture("prepare failed");
+					cameraPreview.setCaptureAllowed(true);
+				}
+				// The renderer drops the whole start on this one: falling back to a
+				// normal start would count down and raise the picker a second time.
+				if (isPortalCancelled(error)) return { success: false, reason: "portal-cancelled" };
 				return { success: false, error: String(error) };
 			}
 		},
@@ -2697,6 +2905,7 @@ export function registerIpcHandlers(
 	/** Drops a prepared session, e.g. when the countdown was cancelled. */
 	ipcMain.handle("cancel-native-linux-prepare", async () => {
 		discardPreparedLinuxCapture("cancelled by the renderer");
+		if (!linuxNativeCaptureSession && !appRecording) cameraPreview.setCaptureAllowed(true);
 		return { success: true };
 	});
 
@@ -2711,7 +2920,7 @@ export function registerIpcHandlers(
 				if (linuxNativeCaptureSession) {
 					return { success: false, error: "Native Linux capture is already running." };
 				}
-				if (!findPipeWireCursorHelperPath()) {
+				if (!findLinuxCaptureHelperPath()) {
 					return { success: false, error: "Native Linux capture helper is not available." };
 				}
 
@@ -2734,6 +2943,7 @@ export function registerIpcHandlers(
 				const session =
 					prepared ??
 					new LinuxNativeCaptureSession({
+						...(await linuxX11Source()),
 						outputPath,
 						cursorMode: portalCursorMode(cursorCaptureMode),
 						fps: request.video.fps,
@@ -2749,6 +2959,9 @@ export function registerIpcHandlers(
 							},
 						},
 						maxCursorSamples: MAX_CURSOR_SAMPLES,
+						// Held until `arm()` below, which waits for the picker to leave the
+						// screen: with no countdown in between (Restart), frame 0 showed it.
+						deferStart: true,
 					});
 				lastLinuxCaptureSession = session;
 
@@ -2761,17 +2974,27 @@ export function registerIpcHandlers(
 				});
 
 				if (!prepared) {
+					cameraPreview.setCaptureAllowed(false);
 					await session.start();
 					// Blocks until the user answers the portal picker, which has no
 					// upper bound. On this path the countdown has already run.
 					await session.waitUntilSourceSelected();
 				}
+				cameraPreview.setCaptureAllowed(session.grantedSourceKind === "window");
 				// Idempotent, and a no-op for a session that was not deferred.
 				session.arm();
 				await session.waitUntilCapturing();
 
 				linuxNativeCaptureSession = session;
 				linuxNativeCaptureRecordingId = recordingId;
+				// A helper that dies mid-take drives the renderer's own stop, as on macOS:
+				// the HUD stops counting and the editor opens on what was recorded.
+				session.onInterrupted = () => {
+					const hudWindow = getMainWindow();
+					if (hudWindow && !hudWindow.isDestroyed()) {
+						hudWindow.webContents.send("stop-recording-from-tray");
+					}
+				};
 				// The portal may lack EMBEDDED and get METADATA instead (#1357): the
 				// pointer is then not in the pixels, so the editor has to draw it.
 				linuxNativeCaptureCursorMode =
@@ -2782,11 +3005,17 @@ export function registerIpcHandlers(
 				// "Screen" }`, so the tray confidently displayed the name of a
 				// window the capture had never been told about.
 				linuxNativeCaptureSourceLabel = linuxSourceLabel(session.grantedSourceKind);
-				setAppRecording(true, linuxNativeCaptureSourceLabel);
+				setAppRecording(true, linuxNativeCaptureSourceLabel, recordingId);
+
+				if (cursorCaptureMode === "editable-overlay") {
+					await startCursorRecording(recordingId);
+				}
 
 				return { success: true, recordingId, path: outputPath };
 			} catch (error) {
 				console.error("Failed to start native Linux recording:", error);
+				resetLinuxCaptureBackendProbe();
+				cameraPreview.setCaptureAllowed(true);
 				linuxNativeCaptureSession = null;
 				linuxNativeCaptureRecordingId = null;
 				linuxNativeCaptureCursorMode = "editable-overlay";
@@ -2795,7 +3024,8 @@ export function registerIpcHandlers(
 				if (outputPath) {
 					await removeEmptyCaptureOutput(outputPath);
 				}
-				return { success: false, error: String(error) };
+				if (isPortalCancelled(error)) return { success: false, cancelled: true };
+				return { success: false, error: error instanceof Error ? error.message : String(error) };
 			}
 		},
 	);
@@ -2827,6 +3057,8 @@ export function registerIpcHandlers(
 
 		try {
 			if (discard) {
+				await stopCursorRecording();
+				pendingCursorRecordingData = null;
 				session.discard();
 				const discarded = path.join(RECORDINGS_DIR, `${RECORDING_FILE_PREFIX}${recordingId}.mp4`);
 				await Promise.all([
@@ -2836,17 +3068,60 @@ export function registerIpcHandlers(
 				return { success: true, discarded: true };
 			}
 
-			const result = await session.stop();
+			let result: Awaited<ReturnType<LinuxNativeCaptureSession["stop"]>>;
+			try {
+				// Stop sampling at the stop request, not after helper teardown.
+				[result] = await Promise.all([
+					session.stop(),
+					cursorCaptureMode === "editable-overlay" ? stopCursorRecording() : Promise.resolve(),
+				]);
+			} catch (error) {
+				// A Stop the user asked for fails as before, with the helper's reason.
+				if (!session.interrupted) {
+					throw error;
+				}
+				// The raw reason is in the log; the user is told what happened to the take.
+				console.error("Failed to stop native Linux recording:", error);
+				return { success: false, error: mainT("dialogs", "recording.captureLost") };
+			}
+			// Worded here, never from the helper's text (its warnings are diagnostics).
+			result.warning =
+				[
+					result.interrupted
+						? mainT("dialogs", "recording.captureInterrupted", {
+								duration: formatDuration(result.durationMs / 1000),
+							})
+						: undefined,
+					result.audioLost ? mainT("dialogs", "recording.audioLost") : undefined,
+				]
+					.filter(Boolean)
+					.join("\n\n") || undefined;
+			nativeRecordingWarning = result.warning
+				? { screenVideoPath: result.path, message: result.warning }
+				: null;
 
-			// The helper collects cursor samples itself, from the same portal
-			// session that produced the pixels, so there is no separate sampler
-			// to stop and no clock offset to correct — the two are one recording.
-			if (cursorCaptureMode === "editable-overlay" && result.cursor.samples.length > 0) {
-				await fs.writeFile(
-					`${result.path}.cursor.json`,
-					JSON.stringify(result.cursor, null, 2),
-					"utf-8",
-				);
+			if (cursorCaptureMode !== "editable-overlay") pendingCursorRecordingData = null;
+
+			// Prefer the helper's own samples — they share the portal session that
+			// produced the pixels, so there is no clock offset to correct. When
+			// the portal had no METADATA cursor mode the track is empty; the X11
+			// sampler started alongside the take then fills the sidecar so
+			// `--auto-zoom` still has clicks to work from. Those fallback samples
+			// still include paused time, which the video does not. Apply the same
+			// compaction and duration bound as browser video (also after interruption).
+			const cursor =
+				result.cursor.samples.length > 0
+					? result.cursor
+					: pendingCursorRecordingData
+						? finalizeSampledCursorTelemetry(
+								pendingCursorRecordingData,
+								result.cursorPauseRanges,
+								result.durationMs,
+							)
+						: null;
+			pendingCursorRecordingData = null;
+			if (cursorCaptureMode === "editable-overlay" && cursor && cursor.samples.length > 0) {
+				await fs.writeFile(`${result.path}.cursor.json`, JSON.stringify(cursor, null, 2), "utf-8");
 			}
 
 			const session_: RecordingSession = {
@@ -2877,12 +3152,15 @@ export function registerIpcHandlers(
 				success: true,
 				path: result.path,
 				session: session_,
+				...(result.warning ? { warning: result.warning } : {}),
 				message: "Native Linux recording session stored successfully",
 			};
 		} catch (error) {
 			console.error("Failed to stop native Linux recording:", error);
 			return { success: false, error: String(error) };
 		} finally {
+			await stopCursorRecording();
+			pendingCursorRecordingData = null;
 			linuxNativeCaptureSession = null;
 			linuxNativeCaptureRecordingId = null;
 			linuxNativeCaptureCursorMode = "editable-overlay";
@@ -2895,6 +3173,11 @@ export function registerIpcHandlers(
 	ipcMain.handle(
 		"start-native-windows-recording",
 		async (_, request: NativeWindowsRecordingRequest) => {
+			if (isWindowsUpdatePending()) {
+				return { success: false, error: WINDOWS_UPDATE_PENDING_MESSAGE };
+			}
+			let startReserved = false;
+			let mailbox: Awaited<ReturnType<typeof createWindowsCameraPreviewMailbox>> | undefined;
 			try {
 				if (!isWindowsGraphicsCaptureOsSupported()) {
 					return {
@@ -2954,10 +3237,16 @@ export function registerIpcHandlers(
 					request.preferSoftwareEncoder === true ||
 					envPreferSoftwareEncoder === "true" ||
 					envPreferSoftwareEncoder === "1";
+				if (request.webcam.enabled)
+					mailbox = await createWindowsCameraPreviewMailbox(app.getPath("temp"));
 				const config = {
+					webcamPreviewPath: mailbox?.file,
 					schemaVersion: 2,
 					recordingId,
 					preferSoftwareEncoder,
+					softwareEncoderAdapters: (
+						await readSoftwareEncoderAdapters(WINDOWS_SOFTWARE_ENCODER_ADAPTERS_FILE)
+					).join("\n"),
 					outputPath,
 					sourceType: request.source.type,
 					sourceId: request.source.sourceId,
@@ -3023,6 +3312,13 @@ export function registerIpcHandlers(
 					outputPath,
 				});
 
+				assertWindowsUpdateIdle();
+				if (appRecording || nativeWindowsCaptureProcess) {
+					return { success: false, error: "Native Windows capture is already running." };
+				}
+				// Reserve startup before cursor/helper awaits without reporting a started take.
+				startReserved = true;
+				setAppRecording(true, selectedSource?.name ?? "Screen", undefined, true);
 				await fs.mkdir(RECORDINGS_DIR, { recursive: true });
 				nativeWindowsCaptureOutput = "";
 				nativeWindowsCaptureTargetPath = outputPath;
@@ -3047,11 +3343,27 @@ export function registerIpcHandlers(
 					pendingCursorRecordingData = null;
 				}
 
+				assertWindowsUpdateIdle();
 				const proc = spawn(helperPath, [JSON.stringify(config)], {
 					cwd: RECORDINGS_DIR,
 					stdio: ["pipe", "pipe", "pipe"],
 					windowsHide: true,
 				});
+				if (mailbox) {
+					const activeMailbox = mailbox;
+					const hud = getMainWindow();
+					const stopPreview = watchWindowsCameraPreview(activeMailbox.file, (jpeg, ratio) => {
+						// A helper the take has let go of may still be alive: never relay its frames.
+						if (proc !== nativeWindowsCaptureProcess) return stopPreview();
+						if (hud && !hud.isDestroyed()) cameraPreview.frame(hud.webContents, jpeg, ratio);
+					});
+					proc.once("close", () => {
+						stopPreview();
+						void activeMailbox
+							.remove()
+							.catch((error: unknown) => console.warn("Could not remove camera preview:", error));
+					});
+				}
 				nativeWindowsCaptureProcess = proc;
 				nativeWindowsCaptureDrainCleanup = attachNativeWindowsCaptureOutputDrain(proc);
 				console.info("[native-wgc] helper spawned", { pid: proc.pid });
@@ -3078,7 +3390,7 @@ export function registerIpcHandlers(
 				});
 
 				const source = selectedSource || { name: "Screen" };
-				setAppRecording(true, source.name);
+				setAppRecording(true, source.name, recordingId);
 
 				// Reported at start, not at stop: the helper decides the camera is a
 				// lost cause during its own init — before it announces "Recording
@@ -3119,7 +3431,9 @@ export function registerIpcHandlers(
 					microphoneDefaulted,
 				};
 			} catch (error) {
+				if (mailbox && !nativeWindowsCaptureProcess) await mailbox.remove().catch(() => undefined);
 				console.error("Failed to start native Windows recording:", error);
+				if (!startReserved) return { success: false, error: String(error) };
 				const failedProc = nativeWindowsCaptureProcess;
 				const failedOutputPaths = [
 					nativeWindowsCaptureTargetPath,
@@ -3138,6 +3452,7 @@ export function registerIpcHandlers(
 					}
 				}
 				await stopCursorRecording();
+				setAppRecording(false, selectedSource?.name ?? "Screen");
 				return { success: false, error: String(error) };
 			}
 		},
@@ -3170,6 +3485,7 @@ export function registerIpcHandlers(
 				normalizeCursorCaptureMode(request.cursor?.mode) ?? "editable-overlay";
 			// A source from Apple's picker records through the session that holds the pick,
 			// and needs no Screen Recording grant -- so nothing here may go near one.
+			ensureMacCameraPreviewWindow();
 			const pickerSession = isMacPickerSourceId(request.source.sourceId) ? macPickerSession : null;
 			// Normally caught by `get-selected-source` first; this is the last word (#965).
 			pickerSession?.forgetSelectionUnlessExcluding(macPickerExcludedWindowIds());
@@ -3217,7 +3533,7 @@ export function registerIpcHandlers(
 				pick?.bounds ?? request.source.bounds ?? sourceDisplay?.bounds ?? getSelectedSourceBounds();
 			const captureExcludedWindowSourceIds: string[] = [];
 			if (request.source.type === "display") {
-				for (const window of [getMainWindow(), getNotesWindow()]) {
+				for (const window of [getMainWindow(), getNotesWindow(), getCameraPreviewWindow()]) {
 					if (window && !window.isDestroyed()) {
 						captureExcludedWindowSourceIds.push(window.getMediaSourceId());
 					}
@@ -3275,7 +3591,8 @@ export function registerIpcHandlers(
 			nativeMacPauseRanges = [];
 			nativeMacIsPaused = false;
 			nativeMacStopInFlight = false;
-			nativeMacRecordingWarning = null;
+			nativeRecordingWarning = null;
+			nativeMacPresenterOverlay = { active: false, cameraInterrupted: false };
 			// Before the cursor session samples. A legacy window otherwise normalises
 			// its opening samples against the display, and a picker window would keep
 			// the picker's frame after the helper has reported the content rect it is
@@ -3317,6 +3634,20 @@ export function registerIpcHandlers(
 						hudWindow.webContents.send("native-mac-system-audio-unavailable");
 					}
 				},
+				(active) => {
+					nativeMacPresenterOverlay = updateMacPresenterOverlayState(
+						nativeMacPresenterOverlay,
+						active,
+						request.webcam.enabled,
+					);
+					const hudWindow = getMainWindow();
+					if (hudWindow && !hudWindow.isDestroyed()) {
+						hudWindow.webContents.send("native-mac-presenter-overlay-changed", {
+							recordingId,
+							...nativeMacPresenterOverlay,
+						});
+					}
+				},
 			);
 
 			const captureStartedAtMs = (await waitForNativeMacCaptureStart(proc)) ?? Date.now();
@@ -3350,7 +3681,7 @@ export function registerIpcHandlers(
 					: 0;
 
 			const source = selectedSource || { name: "Screen" };
-			setAppRecording(true, source.name);
+			setAppRecording(true, source.name, recordingId);
 
 			return {
 				success: true,
@@ -3358,6 +3689,7 @@ export function registerIpcHandlers(
 				path: outputPath,
 				helperPath,
 				startedAtMs: captureStartedAtMs,
+				presenterOverlay: { ...nativeMacPresenterOverlay },
 				microphoneDefaulted,
 				microphoneUnavailable,
 				microphoneNotFound,
@@ -3532,6 +3864,13 @@ export function registerIpcHandlers(
 				console.warn("[native-wgc] stop command channel was already closed");
 			}
 			const stopResult = await stopPromise;
+			const stalledEncoderAdapter = readStalledEncoderAdapter(nativeWindowsCaptureOutput);
+			if (stalledEncoderAdapter) {
+				await rememberSoftwareEncoderAdapter(
+					WINDOWS_SOFTWARE_ENCODER_ADAPTERS_FILE,
+					stalledEncoderAdapter,
+				);
+			}
 			if (!stopResult.ok) {
 				console.error("[native-wgc] stop failed", {
 					reason: stopResult.reason,
@@ -3766,7 +4105,12 @@ export function registerIpcHandlers(
 					truncatedBytes: salvage.truncatedBytes,
 				});
 			}
-			nativeMacRecordingWarning = warning ? { screenVideoPath, message: warning } : null;
+			if (nativeMacPresenterOverlay.cameraInterrupted) {
+				warning = [warning, mainT("common", "presenterOverlay.interruptedDescription")]
+					.filter(Boolean)
+					.join("\n\n");
+			}
+			nativeRecordingWarning = warning ? { screenVideoPath, message: warning } : null;
 
 			// A recovered take most often follows a disk that filled up, and these writes
 			// go to the same volume. The video is already safe on disk, so for a recovered
@@ -4144,7 +4488,22 @@ export function registerIpcHandlers(
 
 	ipcMain.handle(
 		"set-recording-state",
-		async (_, recording: boolean, recordingId?: number, cursorCaptureMode?: CursorCaptureMode) => {
+		async (
+			_,
+			recording: boolean,
+			recordingId?: number,
+			cursorCaptureMode?: CursorCaptureMode,
+			reserveOnly?: boolean,
+		) => {
+			if (recording && isWindowsUpdatePending()) {
+				return { success: false, error: WINDOWS_UPDATE_PENDING_MESSAGE };
+			}
+			const source = selectedSource || { name: "Screen" };
+			if (recording) {
+				// Claim the take synchronously, before cursor setup yields to an updater.
+				setAppRecording(recording, source.name, undefined, true);
+				if (reserveOnly) return { success: true };
+			}
 			const normalizedCursorCaptureMode =
 				normalizeCursorCaptureMode(cursorCaptureMode) ?? "editable-overlay";
 			if (recording && normalizedCursorCaptureMode === "editable-overlay") {
@@ -4153,8 +4512,8 @@ export function registerIpcHandlers(
 				await stopCursorRecording();
 			}
 
-			const source = selectedSource || { name: "Screen" };
-			setAppRecording(recording, source.name);
+			setAppRecording(recording, source.name, recordingId);
+			return { success: true };
 		},
 	);
 
@@ -4263,8 +4622,10 @@ export function registerIpcHandlers(
 			}
 
 			const normalizedPath = path.normalize(filePath);
-			await fs.mkdir(path.dirname(normalizedPath), { recursive: true });
-			await fs.writeFile(normalizedPath, Buffer.from(videoData));
+			// Staged and renamed over the destination: a failed write keeps the file already
+			// there, such as the export a silent remux rewrites (#1104), and a replaced file
+			// keeps its permissions.
+			await writeFileReplacing(normalizedPath, Buffer.from(videoData));
 
 			return {
 				success: true,
@@ -4896,8 +5257,46 @@ export function registerIpcHandlers(
 		setCurrentRecordingSessionState(normalizedSession);
 		currentVideoPath = normalizedSession?.screenVideoPath ?? null;
 		currentProjectPath = null;
-		if (normalizedSession) mcpAppRecorder.takeSaved(normalizedSession.screenVideoPath);
+		if (normalizedSession) {
+			mcpAppRecorder.takeSaved(normalizedSession.screenVideoPath);
+			// Every capture path stamps the session's `createdAt` with its recordingId (the
+			// `Date.now()` it started at), so it names the take `recordingCompletion` tracks.
+			// Any other session (an opened file) carries a fresh `Date.now()` and matches none.
+			recordingCompletion.saved(normalizedSession.createdAt, normalizedSession.screenVideoPath);
+		}
 		return { success: true, session: currentRecordingSession };
+	});
+
+	// A renderer acknowledgement of the actual hand-off, after the duration and
+	// automatic zoom saves. An imported/opened project never emits this signal.
+	const recordingOutcomeSchema = z.discriminatedUnion("status", [
+		z.object({
+			recordingId: z.number().finite(),
+			status: z.literal("ready"),
+			projectId: z.string(),
+		}),
+		z.object({
+			recordingId: z.number().finite(),
+			status: z.enum(["failed", "cancelled"]),
+			message: z.string(),
+		}),
+	]);
+	ipcMain.handle("recording-outcome", async (event, input: unknown) => {
+		// Only the recording bar or the editor, whichever is the main window, ends a take.
+		if (event.sender !== getMainWindow()?.webContents) return { success: false };
+		const parsed = recordingOutcomeSchema.safeParse(input);
+		if (!parsed.success) return { success: false };
+		const outcome = parsed.data;
+		if (outcome.status !== "ready") {
+			recordingCompletion.failed(outcome.recordingId, outcome.message);
+			mcpAppRecorder.recordingFinished(outcome.recordingId);
+			return { success: true };
+		}
+		await recordingCompletion.projectReady(outcome.recordingId, outcome.projectId, (id) =>
+			aiEditionDocuments.getProject(id),
+		);
+		mcpAppRecorder.recordingFinished(outcome.recordingId);
+		return { success: true };
 	});
 
 	ipcMain.handle("get-current-recording-session", () => {
@@ -4905,8 +5304,8 @@ export function registerIpcHandlers(
 			return { success: false };
 		}
 		const warning =
-			nativeMacRecordingWarning?.screenVideoPath === currentRecordingSession.screenVideoPath
-				? nativeMacRecordingWarning.message
+			nativeRecordingWarning?.screenVideoPath === currentRecordingSession.screenVideoPath
+				? nativeRecordingWarning.message
 				: undefined;
 		return { success: true, session: currentRecordingSession, ...(warning ? { warning } : {}) };
 	});
@@ -5120,7 +5519,7 @@ export function registerIpcHandlers(
 			const run = mcpRunners.start({ kind: "sources" });
 			listed = (await run.done.finally(() => run.close())).sources ?? null;
 		}
-		const next = takePrefs(request, listed);
+		const next = takePrefs(request, listed, recordingPrefs.get());
 
 		const before = { source: selectedSource, live: selectedDesktopSource };
 		const restoreSource = () => {
@@ -5128,7 +5527,7 @@ export function registerIpcHandlers(
 			selectedDesktopSource = before.live;
 			broadcastSelectedSource(before.source);
 		};
-		if (process.platform === "linux" && findPipeWireCursorHelperPath()) {
+		if (await linuxPortalOwnsSources(process.platform, findLinuxCaptureHelperPath(), process.env)) {
 			// The portal asks the user once the take starts: nothing here to select.
 		} else {
 			// Where Apple's picker owns the bar's sources, a named take still records what it
@@ -5156,6 +5555,7 @@ export function registerIpcHandlers(
 			}
 		}
 
+		// Read here, not above: a change the user makes while the source is picked is theirs to keep.
 		const userPrefs = pickTakePrefs(recordingPrefs.get());
 		recordingPrefs.set(next);
 		// The prefs are saved to disk: a quit mid-take must not leave the client's for the next
@@ -5183,6 +5583,8 @@ export function registerIpcHandlers(
 		host: mcpToolDeps.host,
 	});
 	const mcpMedia = createMediaTools({
+		recordingActive: () => recordingCompletion.isActive(),
+		waitForRecording: (timeoutMs, signal) => recordingCompletion.wait(timeoutMs, signal),
 		transport: "http",
 		// Recording and exporting change things too: the same switch as edits.
 		editsAllowed: mcpToolDeps.editsAllowed,
@@ -5251,6 +5653,10 @@ export function registerIpcHandlers(
 			}
 		},
 		getAiEditionDocuments: () => aiEditionDocuments,
+		getRecordingsDirs: () => ({
+			dirs: getAllowedReadDirs(),
+			registryDir: DEFAULT_RECORDINGS_DIR,
+		}),
 		getStylePresets: () => stylePresets,
 		getAiEditionLlmConfig,
 		runAiEditionChat: (projectId, sessionId, message, document, sink, signal) =>

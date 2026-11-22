@@ -26,8 +26,19 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
+// No real file behind the fake helper: what a killed take left on disk is stubbed.
+vi.mock("../../recording/nativeMacCaptureSalvage", () => ({
+	salvageNativeMacCapture: vi.fn(async () => ({ ok: false, reason: "no file in a test" })),
+}));
+
 import { spawn } from "node:child_process";
-import { LinuxNativeCaptureSession } from "./linuxNativeCaptureSession";
+import {
+	linuxCaptureBackend,
+	resetLinuxCaptureBackendProbe,
+} from "../../recording/linuxCaptureBackend";
+import { salvageNativeMacCapture } from "../../recording/nativeMacCaptureSalvage";
+import { findLinuxCaptureHelperPath } from "../cursor/recording/pipeWireCursorRecordingSession";
+import { isPortalCancelled, LinuxNativeCaptureSession } from "./linuxNativeCaptureSession";
 
 class FakeHelper extends EventEmitter {
 	stdout = new PassThrough();
@@ -169,6 +180,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 });
 
 describe("LinuxNativeCaptureSession", () => {
@@ -187,6 +199,41 @@ describe("LinuxNativeCaptureSession", () => {
 
 		expect(request).not.toHaveProperty("restoreToken");
 		expect(JSON.stringify(request)).not.toContain("restoreToken");
+	});
+
+	/**
+	 * #1492 hid the helper outside Wayland, so an X11 take never reached its X11
+	 * backend. The whole chain, short of the helper itself: the lookup finds it, a
+	 * probe that names no portal picks X11, and the take hands it the source.
+	 */
+	it("reaches the helper's X11 backend in an X11 session without a portal", async () => {
+		vi.stubEnv("XDG_SESSION_TYPE", "x11");
+		vi.stubEnv("WAYLAND_DISPLAY", undefined);
+		resetLinuxCaptureBackendProbe();
+		const helperPath = findLinuxCaptureHelperPath();
+		expect(helperPath).not.toBeNull();
+		const environment = { XDG_SESSION_TYPE: "x11", DISPLAY: ":0" };
+		const probe = vi.fn(async () => "x11" as const);
+		await expect(linuxCaptureBackend(helperPath as string, environment, probe)).resolves.toBe(
+			"x11",
+		);
+		expect(probe).toHaveBeenCalledWith(helperPath);
+		resetLinuxCaptureBackendProbe();
+
+		const source = { kind: "window" as const, windowId: 42 };
+		const session = new LinuxNativeCaptureSession({
+			source,
+			outputPath: "/tmp/recording.mp4",
+			cursorMode: "metadata",
+			fps: 30,
+			audio: { system: { enabled: false }, microphone: { enabled: false, gain: 1 } },
+			maxCursorSamples: 100,
+		});
+		await startReady(session);
+
+		const [spawned, args] = spawnMock.mock.calls[0];
+		expect(spawned).toBe(helperPath);
+		expect(JSON.parse((args as string[])[0])).toMatchObject({ source });
 	});
 
 	it("reports the cursor mode the helper fell back to (#1357)", async () => {
@@ -211,6 +258,46 @@ describe("LinuxNativeCaptureSession", () => {
 		await startReady(session);
 
 		expect(session.cursorMode).toBe("metadata");
+	});
+
+	it("marks a take that lost its audio, without the helper's wording", async () => {
+		const session = newSession();
+		await startReady(session);
+		helper.emitEvent({
+			event: "warning",
+			timestampMs: 1_050,
+			code: "audio-unavailable",
+			message: "PipeWire could not be loaded, so the recording has no audio track",
+		});
+		await flushStdout();
+
+		const result = await finishCapture(session, 2_000);
+		expect(result.audioLost).toBe(true);
+		expect(result.warning).toBeUndefined();
+	});
+
+	// v2.3.0-rc.2 on GNOME Wayland: Mutter marks a frame of most takes corrupted, and
+	// the helper's text for it reached the editor as a toast.
+	it("keeps the helper's per-frame warnings out of the take", async () => {
+		const session = newSession();
+		await startReady(session);
+		helper.emitEvent({
+			event: "warning",
+			code: "frame-dropped",
+			message:
+				"the compositor's buffer failed validation (producer-marked-frame-corrupted), so this " +
+				"frame was dropped: dataType=DmaBuf stride=7680 width=1920 height=1080",
+		});
+		helper.emitEvent({
+			event: "warning",
+			code: "frames-dropped",
+			message: "2 captured frame(s) were replaced before the encoder could take them",
+		});
+		await flushStdout();
+
+		const result = await finishCapture(session, 2_000);
+		expect(result.warning).toBeUndefined();
+		expect(result.audioLost).toBeUndefined();
 	});
 
 	it("reports the source kind the portal granted", async () => {
@@ -315,6 +402,71 @@ describe("LinuxNativeCaptureSession", () => {
 		helper.emit("exit", 1, null);
 
 		await expect(selecting).rejects.toThrow();
+	});
+
+	// The rc.3 Linux pass: a dismissed picker read as a failed prepare, so the
+	// renderer counted down and asked again. The cancel has to stay a cancel.
+	it("tells a dismissed picker apart from a failure", async () => {
+		const session = newSession(true);
+		await startReady(session);
+
+		const selecting = session.waitUntilSourceSelected();
+		helper.emitEvent({
+			event: "error",
+			timestampMs: 1_100,
+			code: "portal-cancelled",
+			message: "The screen capture request was cancelled.",
+		});
+		const error = await selecting.catch((reason: unknown) => reason);
+
+		expect(isPortalCancelled(error)).toBe(true);
+		expect(isPortalCancelled(new Error("The screen capture request was cancelled."))).toBe(false);
+	});
+
+	it("keeps a cancel that arrived with `ready`, before anyone waited", async () => {
+		const session = newSession(true);
+		const started = session.start();
+		await Promise.resolve();
+		// One chunk: the reader dispatches both lines before `start()` returns.
+		helper.stdout.write(
+			[
+				{ event: "ready", timestampMs: 1_000 },
+				{
+					event: "error",
+					timestampMs: 1_001,
+					code: "portal-cancelled",
+					message: "The screen capture request was cancelled.",
+				},
+			]
+				.map(
+					(event) => `${JSON.stringify({ schemaVersion: 1, ...event })}
+`,
+				)
+				.join(""),
+		);
+		await started;
+		helper.emit("exit", 1, null);
+
+		const error = await session.waitUntilSourceSelected().catch((reason: unknown) => reason);
+		expect(isPortalCancelled(error)).toBe(true);
+	});
+
+	it.each([
+		"No ScreenCast portal",
+		"SelectSources response: Portal request didn't succeed: Cancelled",
+	])("does not infer cancellation from a portal-failed diagnostic: %s", async (message) => {
+		const session = newSession(true);
+		await startReady(session);
+
+		const selecting = session.waitUntilSourceSelected();
+		helper.emitEvent({
+			event: "error",
+			timestampMs: 1_100,
+			code: "portal-failed",
+			message,
+		});
+
+		expect(isPortalCancelled(await selecting.catch((reason: unknown) => reason))).toBe(false);
 	});
 
 	it("resolves the source selection immediately once it has already arrived", async () => {
@@ -526,6 +678,11 @@ describe("LinuxNativeCaptureSession", () => {
 		const result = await finishCapture(session, 2_000);
 
 		expect(result.cursor.samples.map((sample) => sample.timeMs)).toEqual([100, 300, 500]);
+		expect(session.cursorStartTimeMs).toBe(1_000);
+		expect(result.cursorPauseRanges).toEqual([
+			{ startMs: 200, endMs: 400 },
+			{ startMs: 600, endMs: 800 },
+		]);
 		expect(helper.stdinWrites.filter((line) => line === "pause\n")).toHaveLength(2);
 		expect(helper.stdinWrites.filter((line) => line === "resume\n")).toHaveLength(2);
 	});
@@ -699,6 +856,166 @@ describe("LinuxNativeCaptureSession", () => {
 	});
 
 	/**
+	 * The rc.1 pass: a take started from Restart, the one start with no countdown
+	 * between the picker and the first frame, had the picker's closing animation in
+	 * frame 0.
+	 */
+	describe("arming right after the picker", () => {
+		const flushEvents = () => new Promise((resolve) => setImmediate(resolve));
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		async function answeredSession(source?: { kind: "window"; windowId: number }) {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+			const session = new LinuxNativeCaptureSession({
+				deferStart: true,
+				...(source ? { source } : {}),
+				outputPath: "/tmp/recording.mp4",
+				cursorMode: "metadata",
+				fps: 30,
+				audio: { system: { enabled: false }, microphone: { enabled: false, gain: 1 } },
+				maxCursorSamples: 100,
+			});
+			const started = session.start();
+			helper.emitEvent({ event: "ready", timestampMs: 1_000 });
+			await flushEvents();
+			await started;
+			helper.emitEvent({ event: "source-selected", timestampMs: 1_100, nodeId: 42 });
+			await flushEvents();
+			return session;
+		}
+
+		it("holds the first frame until the portal's picker has left the screen", async () => {
+			const session = await answeredSession();
+
+			session.arm();
+			expect(helper.stdinWrites).not.toContain("record\n");
+			vi.advanceTimersByTime(499);
+			expect(helper.stdinWrites).not.toContain("record\n");
+			vi.advanceTimersByTime(1);
+			expect(helper.stdinWrites).toContain("record\n");
+		});
+
+		it("arms at once when a countdown already outlasted the picker", async () => {
+			const session = await answeredSession();
+
+			vi.advanceTimersByTime(3_000);
+			session.arm();
+			expect(helper.stdinWrites).toContain("record\n");
+		});
+
+		it("arms direct X11, which has no picker, at once", async () => {
+			const session = await answeredSession({ kind: "window", windowId: 7 });
+
+			session.arm();
+			expect(helper.stdinWrites).toContain("record\n");
+		});
+	});
+
+	/**
+	 * The rc.1 pass: a helper killed mid-take left the HUD counting, and Stop then
+	 * failed with "The Linux capture helper is not running." while the decodable
+	 * partial take sat orphaned in the recordings folder.
+	 */
+	describe("a helper that dies mid-take", () => {
+		async function capturingSession() {
+			const session = newSession();
+			await startReady(session);
+			emitCaptureStarted(1_200);
+			await flushStdout();
+			return session;
+		}
+
+		it("says so as soon as it dies, not at Stop", async () => {
+			const session = await capturingSession();
+			const onInterrupted = vi.fn();
+			session.onInterrupted = onInterrupted;
+
+			helper.emit("exit", null, "SIGKILL");
+
+			expect(onInterrupted).toHaveBeenCalledOnce();
+		});
+
+		it("is not reported for a stop it was asked for", async () => {
+			const session = await capturingSession();
+			const onInterrupted = vi.fn();
+			session.onInterrupted = onInterrupted;
+
+			await finishCapture(session, 4_000);
+
+			expect(onInterrupted).not.toHaveBeenCalled();
+		});
+
+		it("is not reported for a discard", async () => {
+			const session = await capturingSession();
+			const onInterrupted = vi.fn();
+			session.onInterrupted = onInterrupted;
+
+			session.discard();
+			helper.emit("exit", null, "SIGTERM");
+
+			expect(onInterrupted).not.toHaveBeenCalled();
+		});
+
+		it("hands back the part of the take it wrote, marked interrupted", async () => {
+			vi.mocked(salvageNativeMacCapture).mockResolvedValueOnce({
+				ok: true,
+				screenVideoPath: "/tmp/recording.mp4",
+				videoSamples: 640,
+				durationSec: 21.5,
+				truncatedBytes: 0,
+			});
+			const session = await capturingSession();
+			emitCursorSample(1_300);
+			await flushStdout();
+			helper.emit("exit", null, "SIGKILL");
+
+			const result = await session.stop();
+
+			expect(salvageNativeMacCapture).toHaveBeenCalledWith("/tmp/recording.mp4");
+			expect(result).toMatchObject({
+				path: "/tmp/recording.mp4",
+				durationMs: 21_500,
+				frames: 640,
+				interrupted: true,
+			});
+			expect(result.cursor.samples.length).toBeGreaterThan(0);
+		});
+
+		it("still fails when nothing usable was written", async () => {
+			const session = await capturingSession();
+			helper.emit("exit", null, "SIGKILL");
+
+			await expect(session.stop()).rejects.toThrow(/exited/);
+		});
+
+		it("keeps the take but does not call it interrupted when it fails after the user's Stop", async () => {
+			vi.mocked(salvageNativeMacCapture).mockResolvedValueOnce({
+				ok: true,
+				screenVideoPath: "/tmp/recording.mp4",
+				videoSamples: 300,
+				durationSec: 10,
+				truncatedBytes: 0,
+			});
+			const session = await capturingSession();
+			const onInterrupted = vi.fn();
+			session.onInterrupted = onInterrupted;
+
+			const stopping = session.stop();
+			await flushStdout();
+			helper.emit("exit", 1, null);
+			const result = await stopping;
+
+			expect(result.path).toBe("/tmp/recording.mp4");
+			expect(result.interrupted).toBeUndefined();
+			expect(session.interrupted).toBe(false);
+			expect(onInterrupted).not.toHaveBeenCalled();
+		});
+	});
+
+	/**
 	 * Save Diagnostics' `helperOutput.linux`. Before it, a Linux bundle had no entry for
 	 * the helper at all, where Windows and macOS keep their helper's raw output.
 	 */
@@ -761,6 +1078,73 @@ describe("LinuxNativeCaptureSession", () => {
 
 			expect(Buffer.byteLength(session.helperOutput, "utf8")).toBeLessThanOrEqual(64 * 1024);
 			expect(session.helperOutput).toBe("€".repeat(21_845));
+		});
+	});
+
+	describe("granted capture bounds", () => {
+		it("keeps compositor origin separate from stream pixel dimensions", async () => {
+			const session = newSession();
+			await startReady(session);
+			helper.emitEvent({
+				event: "source-selected",
+				timestampMs: 1_050,
+				nodeId: 42,
+				sourceKind: "monitor",
+				positionX: 1920,
+				positionY: 0,
+			});
+			helper.emitEvent({
+				event: "stream-started",
+				timestampMs: 1_100,
+				nodeId: 42,
+				width: 1920,
+				height: 1080,
+				positionX: 1920,
+				positionY: 0,
+				sourceKind: "monitor",
+			});
+			await flushStdout();
+
+			expect(session.grantedCaptureOrigin).toEqual({
+				x: 1920,
+				y: 0,
+			});
+			expect(session.grantedCaptureSize).toEqual({ width: 1920, height: 1080 });
+		});
+
+		it("does not invent an origin when the helper only reports size", async () => {
+			const session = newSession();
+			await startReady(session);
+			helper.emitEvent({
+				event: "stream-started",
+				timestampMs: 1_100,
+				nodeId: 42,
+				width: 1280,
+				height: 720,
+				sourceKind: "monitor",
+			});
+			await flushStdout();
+
+			expect(session.grantedCaptureOrigin).toBeNull();
+			expect(session.grantedCaptureSize).toEqual({ width: 1280, height: 720 });
+		});
+
+		it("treats a zero origin as a real position, not a missing one", async () => {
+			const session = newSession();
+			await startReady(session);
+			helper.emitEvent({
+				event: "source-selected",
+				timestampMs: 1_200,
+				nodeId: 42,
+				positionX: 0,
+				positionY: 0,
+			});
+			await flushStdout();
+
+			expect(session.grantedCaptureOrigin).toEqual({
+				x: 0,
+				y: 0,
+			});
 		});
 	});
 });

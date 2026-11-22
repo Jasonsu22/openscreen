@@ -16,11 +16,51 @@ flowchart LR
 
 The HUD starts and controls a recording. The source selector chooses a display or window and the countdown gives the user time to prepare. On Linux there is no in-app source selector: the compositor's portal picker takes its place. It is raised before the countdown, not during it — the helper negotiates the portal, reports `source-selected`, and then waits for `record` on stdin while the app counts down. Electron resolves the source and output paths, starts the selected capture backend, and records cursor telemetry alongside media. Stop finalizes the media and session files; the resulting paths are passed to the editor as recording assets.
 
+The in-app MCP server can observe this lifecycle through
+[`waitForRecording`](mcp-server.md#waiting-for-a-user-controlled-take). Its target is
+the current recording ID, not the current project or a newly created file. The
+recorder reports failure/discard explicitly; the editor acknowledges completion
+after the project's duration and automatic-zoom saves. Waiting never controls
+capture, and timing out or cancelling a request leaves the take running.
+
 ## The HUD
 
 `LaunchWindow` is the recording controller. Its control row exposes recording, pause, source, microphone, system-audio, webcam, cursor, settings, and stop/restart actions through the HUD controls. The overlay is click-through, so it does not intercept the application being recorded — but it is never *born* that way: the renderer asks for it on mount over `hud-overlay-ignore-mouse-events`, and `electron/windows.ts` applies it as `setIgnoreMouseEvents(ignore)`, with no `{ forward: true }`. While the window is input-transparent Chromium delivers it no pointer events at all, so the way back out is a poll: the main process samples the OS cursor and pushes the window-relative point over `hud-overlay-cursor`, and the renderer hit-tests it to decide when the HUD's own controls temporarily opt into pointer handling. On Linux none of this runs: `setIgnoreMouseEvents` is a no-op there, so the renderer never asks for click-through and the HUD stays interactive — which is why its drag region sits on the grab handle rather than on the transparent root. (Until #385 the lift was Electron's `{ forward: true }` — a global `WH_MOUSE_LL` hook on Windows that Windows can revoke without telling the app, leaving the HUD painted and permanently dead. The poll replaced it.)
 
 Electron applies `setContentProtection(true)` to the HUD window (`applyContentProtection` in `electron/windows.ts`). This keeps the controller out of captures and also makes it invisible in screenshots. It is skipped on macOS 26 and later, which never displays a protected window, and on Windows before 11 22H2 (build 22621), where it leaves the click-through HUD unable to take a click (#1105). On those Windows versions the HUD can appear in recordings; on macOS the ScreenCaptureKit helper still excludes it by window id. For a testing session only, `OPENSCREEN_DISABLE_CONTENT_PROTECTION=1` disables the protection; the code warns that the HUD then appears in captures. The tray icon is the reliable way to refocus OpenScreen or stop a recording when the click-through HUD is not convenient or is not visible.
+
+## Presenter camera preview
+
+The HUD camera has a draggable rounded rectangular self-view with show/hide and three width choices.
+It shows the complete camera frame at the shared recording stream’s aspect ratio, including when resized.
+Its preview button is hidden when the camera is off. The preview shares
+`useScreenRecorder`'s stream and stops with its owning HUD; it does not acquire another camera.
+`useFloatingCameraPreview` publishes small JPEG frames to the auxiliary window, with bounded
+payloads and one IPC request in flight. Audio preference broadcasts in the HUD preserve
+its resolved camera selection so the preview does not blink when audio is toggled.
+
+On Windows, the renderer releases its validation stream before the native helper opens the
+camera. A separate helper worker samples that same native camera at up to 5 fps into a bounded,
+320px-wide top-down BMP mailbox, atomically replacing the latest frame in a private temporary
+directory. Electron reads one frame at a time and relays a JPEG through the same preview
+controller. Closing the helper stops polling and removes the directory, including incomplete
+writes. The worker does not change the recording encoder or its clock. Rebuild the Windows
+helper to enable preview during native takes; an older helper cannot publish those frames.
+
+Hiding or resizing retains the window id. macOS capture excludes that id alongside the HUD
+and Notes, including windows hidden when capture starts: the helper lists off-screen windows
+only while one of the windows it must exclude is hidden, and on-screen windows otherwise. This
+requires rebuilding the native helper. Windows uses content protection for the preview (which does not use click-through).
+`OPENSCREEN_DISABLE_CONTENT_PROTECTION=1` also disables Windows preview exclusion: use it
+only for UI inspection, never for capture-exclusion evidence.
+
+Linux has no portal API to exclude an app window from a monitor capture. Preview is available
+while idle and during native **window** recordings. Before opening the portal, the controller
+hides it; only a confirmed `window` source allows it to return. Monitor, virtual, unknown, and
+browser-fallback takes keep it hidden, including after show/hide requests. The HUD hides
+the preview toggle until recording ends. The camera sidecar
+continues recording normally. Supporting a visible preview during full-monitor Linux capture
+would require compositor-specific exclusion support; this implementation does not claim it.
 
 ## Capture backends
 
@@ -78,7 +118,39 @@ The macOS helper mixes the same two sources into one AAC track (`AudioTrackMixer
 
 The Linux helper mixes the same two sources into one AAC track as well (`AudioMix` in `electron/native/pipewire-capture/src/capture.rs`), and its emit cursor is the data-driven one Windows had: `AudioEncoder::next_pts` is a running count of the samples handed to the encoder, advanced only when a block is encoded, and `AudioMix::pump` returns early when no input has any. Nothing in that code makes a chunk go out for every chunk of real time — what does is the tap. System audio here is the default sink's MONITOR, and PipeWire keeps delivering its buffers whether or not anything is playing, silence included, where WASAPI loopback simply stops. So the count advances at real time for as long as the take runs and the cursor cannot stall. That is a property of the capture source and not of the timeline code, which is the thing to know before moving Linux audio off the sink monitor: a source that gates silence would reproduce the Windows failure above exactly (#406). The anchor half is a decision rather than an accident — the first video frame sets the epoch and clears the audio rings at that instant ("video frame 0 is now, so audio sample 0 is now too"), which is what keeps the pre-roll captured while the portal picker was up, an interval with no upper bound, from shifting the whole track earlier; `cargo test` covers it. The tail is covered by `Capture::finish`, which drains the rings and flushes the AAC encoder before the video flush, so the file ends with the take rather than with the last sound in it. What a mid-take overflow costs is bounded the same way: the ring drops its oldest samples and owes back silence of exactly that length, so the encoder falling two seconds behind leaves a gap where it happened instead of pulling every later sound earlier for the rest of the recording, and it is reported as `audio-dropped`. `npm run test:pw-audio-timeline:linux` measures it end to end — a tone played at a known instant, then the audio track's length against the video track's in the same file. Before it, the whole record that any of this held was one sentence in a commit message: a live 29-second capture whose 18-second tone came back as 18 seconds of steady signal, with the two streams ending 62 ms apart (video 29.100 s, audio 29.162 s). That 62 ms is also why the script allows 250 ms between the tracks where the macOS one allows 100: those two come out of a single writer session, and these two do not — the video track ends at the last `advance()` and the audio track at everything the rings still held, plus AAC's final padded block.
 
-Cursor samples are persisted as cursor telemetry rather than baked into editable-overlay recordings. The loader resolves the sidecar at `<videoPath>.cursor.json` or through the recording links; see [cursor.md](cursor.md) for the telemetry format and rendering path.
+Cursor samples are persisted as cursor telemetry rather than baked into editable-overlay recordings. The loader resolves the sidecar at `<videoPath>.cursor.json` or through the recording links; see [cursor.md](cursor.md) for the telemetry format and rendering path. On Linux X11, when the portal cannot supply METADATA cursor samples and the take uses editable-overlay, the same sidecar is filled by the X11 pointer sampler during the take so `--auto-zoom` has clicks to work from. A system-cursor take does not start that sampler.
+
+## macOS Presenter Overlay and independent camera recording
+
+Presenter Overlay is a macOS screen-sharing effect. It composites the person into the
+screen video; it does not create OpenScreen's independently editable camera track.
+Apple documents that enabling the effect changes the camera feed available to other
+capture sessions ([ScreenCaptureKit at WWDC23](https://developer.apple.com/videos/play/wwdc2023/10136/)).
+
+The effect is observed through the primary screen stream's
+`SCStreamDelegate.outputVideoEffectDidStart(for:)` and
+`outputVideoEffectDidStop(for:)` callbacks. The auxiliary system-audio stream is ignored.
+
+The helper emits additive warning events. The main process associates them with the
+current take and whether an independent camera recorder actually started; the renderer
+accepts only its starting or current recording ID. `webcam.enabled` reports that recorder,
+not the UI toggle, so a camera that failed to start does not produce a false warning. The
+start response also carries a state snapshot so early callbacks are not lost. Duplicate
+transitions are coalesced.
+
+Once an effect has overlapped independent camera recording, disabling it does not clear
+the warning: missing earlier frames cannot be recovered by switching the effect off.
+The HUD shows only this in-take camera warning. The same short message travels through
+the existing recording-import warning path into the editor as a toast. Camera-off
+effect changes do not produce UI. Starting a new take resets this history. No effect
+notification automatically stops or pauses a take, deletes a track, switches modes, or
+promises camera recovery.
+
+These notices do not implement simultaneous independent-camera compatibility with
+Presenter Overlay. System effect availability and composition remain controlled by
+macOS and the selected source. Not validated: Presenter Overlay already active when a
+take starts, Large mode, full-display captures, other macOS versions or devices, and
+packaged builds.
 
 ## Known gaps
 

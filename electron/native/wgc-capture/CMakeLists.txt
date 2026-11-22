@@ -38,6 +38,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(wgc-capture
   src/audio_sample_utils.cpp
   src/audio_sample_utils.h
+  src/capture_session.h
   src/desktop_icon_cover.cpp
   src/desktop_icon_cover.h
   src/dpi_awareness.h
@@ -47,6 +48,8 @@ add_executable(wgc-capture
   src/frame_visibility.h
   src/dshow_webcam_capture.cpp
   src/dshow_webcam_capture.h
+  src/dxgi_duplication_session.cpp
+  src/dxgi_duplication_session.h
   src/main.cpp
   src/mf_encoder.cpp
   src/mf_encoder.h
@@ -62,6 +65,8 @@ add_executable(wgc-capture
   src/webcam_format.cpp
   src/webcam_format.h
   src/webcam_capture.h
+  src/webcam_preview.h
+  src/webcam_preview_bitmap.h
   src/wgc_session.cpp
   src/wgc_session.h
 )
@@ -78,6 +83,7 @@ target_link_libraries(wgc-capture PRIVATE
   avrt
   d3d11
   dxgi
+  gdi32
   mf
   mfplat
   mfreadwrite
@@ -144,6 +150,7 @@ target_compile_definitions(webcam_format_test PRIVATE
 )
 
 target_compile_options(webcam_format_test PRIVATE /EHsc /W4 /utf-8)
+target_link_libraries(webcam_format_test PRIVATE strmiids)
 
 add_executable(frame_visibility_test
   src/frame_visibility.cpp
@@ -212,3 +219,9 @@ target_link_libraries(mf_encoder_color_test PRIVATE
   ole32
   propsys
 )
+
+add_executable(webcam_preview_bitmap_test
+  src/webcam_preview_bitmap.h
+  src/webcam_preview_bitmap_test.cpp
+)
+target_compile_options(webcam_preview_bitmap_test PRIVATE /EHsc /W4 /utf-8)

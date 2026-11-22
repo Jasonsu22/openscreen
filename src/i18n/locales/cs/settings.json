@@ -351,7 +351,12 @@
 		"done": "Hotovo",
 		"ratio": "Poměr",
 		"cropVideo": "Oříznout video",
-		"lockAspectRatio": "Zamknout poměr stran"
+		"lockAspectRatio": "Zamknout poměr stran",
+		"x": "X (px)",
+		"y": "Y (px)",
+		"width": "Šířka (px)",
+		"height": "Výška (px)",
+		"position": "Poloha a velikost ořezu v pixelech"
 	},
 	"zoom": {
 		"position": {
@@ -388,6 +393,7 @@
 	},
 	"audio": {
 		"outputGain": "Výstupní úroveň",
+		"muteRecording": "Ztlumit nahrávku",
 		"help": "Hlas se automaticky vyrovná na standardní hlasitost. Výstupní úroveň upravte od ní; aplikuje se stejně v náhledu i při exportu.",
 		"reset": "Obnovit zvuk",
 		"title": "Zvuk"

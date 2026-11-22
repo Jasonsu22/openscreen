@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
-import { act, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/contexts/I18nContext", () => ({
-	useScopedT: () => (key: string) => key,
-}));
+vi.mock("@/contexts/I18nContext", () => {
+	const translate = (key: string) => key;
+	return { useScopedT: () => translate };
+});
 
 vi.mock("sonner", () => ({
 	toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -25,6 +26,7 @@ vi.mock("./recorderHandle", () => ({
 	})),
 }));
 
+import { toast } from "sonner";
 import { useScreenRecorder } from "./useScreenRecorder";
 
 type ElectronAPI = Window["electronAPI"];
@@ -51,6 +53,8 @@ function stubElectronAPI() {
 		getPlatform: vi.fn(() => "linux"),
 		getSelectedSource: vi.fn(async () => null),
 		isNativeLinuxCaptureAvailable: vi.fn(async () => ({ success: true, available: true })),
+		prepareNativeLinuxRecording: vi.fn(async () => ({ success: true, recordingId: 7 })),
+		cancelNativeLinuxPrepare: vi.fn(async () => ({ success: true })),
 		startNativeLinuxRecording: vi.fn(async () => ({ success: true, recordingId: 7 })),
 		stopNativeLinuxRecording: vi.fn(),
 		attachNativeLinuxWebcamRecording: vi.fn(async () => ({ success: true, session: {} })),
@@ -90,6 +94,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	cleanup();
 	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
@@ -160,5 +165,24 @@ describe("useScreenRecorder native Linux prepare", () => {
 			expect.objectContaining({ recordingId: 42 }),
 		);
 		expect(view.result.current.recording).toBe(true);
+	});
+
+	// The rc.1 pass: the low-disk refusal came only after the picker and the whole
+	// 3-2-1, where a voice-over start refuses at once.
+	it("refuses a take the disk has no room for before raising the picker", async () => {
+		api.checkRecordingStorage = vi.fn(async () => ({ success: false, error: "only 394 MB free" }));
+		const view = renderHook(() => useScreenRecorder());
+		await settle();
+
+		await act(async () => {
+			view.result.current.toggleRecording();
+		});
+		await settle();
+
+		expect(toast.error).toHaveBeenCalledWith("only 394 MB free");
+		expect(api.prepareNativeLinuxRecording).not.toHaveBeenCalled();
+		expect(api.showCountdownOverlay).not.toHaveBeenCalled();
+		expect(api.startNativeLinuxRecording).not.toHaveBeenCalled();
+		expect(view.result.current.recording).toBe(false);
 	});
 });

@@ -196,6 +196,7 @@
 		"exportFailedGeneric": "Error al exportar.",
 		"writingFile": "Escribiendo archivo…",
 		"renderingFrames": "Renderizando fotogramas",
+		"renderingGif": "Exportando el GIF",
 		"framesEta": "{{current}} / {{total}} fotogramas · ETA {{eta}}s",
 		"preparingEncoder": "Preparando codificador…",
 		"close": "Cerrar",
@@ -322,7 +323,24 @@
 		"stop": "Detener",
 		"stopping": "Deteniendo…",
 		"stopped": "Has detenido este turno. Se han conservado los cambios ya aplicados.",
-		"stopFailed": "No se pudo detener el turno del agente."
+		"stopFailed": "No se pudo detener el turno del agente.",
+		"usageComplete": "{{tokens}} tokens",
+		"usagePartial": "{{tokens}} tokens conocidos · incompleto",
+		"usageUnavailable": "Uso de tokens no disponible",
+		"usageCoverage": "{{counted}} de {{calls}} llamadas al modelo contabilizadas",
+		"usageInput": "Entrada: {{tokens}}",
+		"usageOutput": "Salida: {{tokens}}",
+		"usageCachedInput": "Entrada en caché declarada: {{tokens}}",
+		"usageCacheCreation": "Entrada de creación de caché declarada: {{tokens}}",
+		"usageReasoning": "Salida de razonamiento declarada: {{tokens}}",
+		"executionSteps": "Pasos de ejecución",
+		"stepStatus": {
+			"running": "En curso",
+			"succeeded": "Correcto",
+			"failed": "Error",
+			"stopped": "Detenido"
+		},
+		"stepReasoning": "Razonamiento"
 	},
 	"newProjectDialog": {
 		"title": "Nuevo proyecto",
@@ -346,7 +364,15 @@
 		"openHint": "para abrir",
 		"browseFiles": "Explorar archivos…",
 		"deleteProject": "Eliminar proyecto",
-		"confirmDelete": "¿Eliminar este proyecto? Tus grabaciones se conservan."
+		"confirmDelete": "¿Eliminar este proyecto? Tus grabaciones se conservan.",
+		"confirmDeleteProject": "¿Eliminar este proyecto?",
+		"alsoTrash": "Mover también sus grabaciones a la Papelera ({{size}})",
+		"alsoRecycle": "Mover también sus grabaciones a la Papelera de reciclaje ({{size}})",
+		"recordingsKeptFor": "Se conservan las grabaciones que usa {{projects}}.",
+		"recordingsKeptUnreadable": "No se pudieron leer algunos proyectos, así que se conservan las grabaciones de este proyecto.",
+		"trashFailed": "No se pudieron mover las grabaciones a la Papelera. ¿Eliminarlas definitivamente?",
+		"recycleFailed": "No se pudieron mover las grabaciones a la Papelera de reciclaje. ¿Eliminarlas definitivamente?",
+		"deletePermanently": "Eliminar definitivamente"
 	},
 	"editClipDialog": {
 		"title": "Editar clip",
@@ -357,6 +383,10 @@
 		"duration": "Duración final",
 		"reset": "Restablecer",
 		"apply": "Aplicar",
+		"rotation": "Rotación",
+		"rotationUpright": "0°",
+		"rotationTurned": "180°",
+		"rotationTip": "Poner la imagen del revés, p. ej. para una cámara montada al revés",
 		"pickClipTitle": "Elige un clip para editar",
 		"clipLabel": "Clip {{index}}"
 	},

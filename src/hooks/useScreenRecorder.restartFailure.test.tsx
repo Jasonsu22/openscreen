@@ -2,9 +2,10 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/contexts/I18nContext", () => ({
-	useScopedT: () => (key: string) => key,
-}));
+vi.mock("@/contexts/I18nContext", () => {
+	const translate = (key: string) => key;
+	return { useScopedT: () => translate };
+});
 
 vi.mock("sonner", () => ({
 	toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
@@ -13,7 +14,7 @@ vi.mock("sonner", () => ({
 // The browser pipeline's MediaRecorder, cut down to what Restart touches: a stop that
 // fires "stop", and a take already streamed to disk.
 vi.mock("./recorderHandle", () => ({
-	createRecorderHandle: () => {
+	createRecorderHandle: vi.fn(() => {
 		const recorder = Object.assign(new EventTarget(), {
 			state: "recording" as RecordingState,
 			stop: () => undefined,
@@ -28,10 +29,11 @@ vi.mock("./recorderHandle", () => ({
 			isStreaming: () => true,
 			discard: async () => undefined,
 		};
-	},
+	}),
 }));
 
 import { toast } from "sonner";
+import { createRecorderHandle } from "./recorderHandle";
 import { useScreenRecorder } from "./useScreenRecorder";
 
 type ElectronAPI = Window["electronAPI"];
@@ -50,7 +52,7 @@ function stubElectronAPI(platform: "win32" | "linux") {
 		showCountdownOverlay: vi.fn(async () => true),
 		setCountdownOverlayValue: vi.fn(async () => true),
 		hideCountdownOverlay: vi.fn(async () => true),
-		setRecordingState: vi.fn(),
+		setRecordingState: vi.fn(async () => ({ success: true })),
 		discardCursorTelemetry: vi.fn(),
 		isNativeWindowsCaptureAvailable: vi.fn(async () => ({ success: true, available: true })),
 		startNativeWindowsRecording: vi.fn(async () => ({ success: true, recordingId: 7 })),
@@ -84,7 +86,7 @@ function stubBrowserCapture() {
 	}));
 	Object.defineProperty(navigator, "mediaDevices", {
 		configurable: true,
-		value: { getUserMedia },
+		value: { getUserMedia, getDisplayMedia: getUserMedia },
 	});
 	vi.stubGlobal(
 		"MediaStream",
@@ -132,6 +134,7 @@ async function restart(view: RecorderView) {
 beforeEach(() => {
 	vi.useFakeTimers();
 	vi.mocked(toast.error).mockClear();
+	vi.mocked(createRecorderHandle).mockClear();
 });
 
 afterEach(() => {
@@ -143,6 +146,90 @@ afterEach(() => {
 
 // Restart discards the take before the next one is asked for. When that one does not
 // start, the take is gone and the user has to be told (#995).
+describe("browser take start reservation", () => {
+	it("does not construct a recorder when the main process refuses a queued Windows take", async () => {
+		const capture = stubBrowserCapture();
+		api.getPlatform.mockReturnValue("win32");
+		api.isNativeWindowsCaptureAvailable.mockResolvedValue({
+			success: true,
+			available: false,
+			reason: "missing-helper",
+		});
+		api.setRecordingState.mockResolvedValue({
+			success: false,
+			error: "A Windows update is pending",
+		});
+		const view = renderHook(() => useScreenRecorder());
+		await settle();
+		await act(async () => {
+			await view.result.current.startRecordingImmediately();
+		});
+		expect(view.result.current.recording).toBe(false);
+		expect(createRecorderHandle).not.toHaveBeenCalled();
+		expect(toast.error).toHaveBeenCalledWith("A Windows update is pending");
+		const stream = await capture.mock.results[0].value;
+		expect(stream.getTracks()[0].stop).toHaveBeenCalled();
+	});
+
+	it("releases the claim when recorder construction fails", async () => {
+		stubBrowserCapture();
+		vi.mocked(createRecorderHandle).mockImplementationOnce(() => {
+			throw new Error("recorder failed");
+		});
+		const view = renderHook(() => useScreenRecorder());
+		await settle();
+		await act(async () => {
+			await view.result.current.startRecordingImmediately();
+		});
+		expect(view.result.current.recording).toBe(false);
+		expect(api.setRecordingState).toHaveBeenCalledWith(false);
+		expect(api.setRecordingState.mock.calls[0]).toEqual([
+			true,
+			undefined,
+			expect.any(String),
+			true,
+		]);
+		expect(api.setRecordingState.mock.invocationCallOrder[0]).toBeLessThan(
+			vi.mocked(createRecorderHandle).mock.invocationCallOrder[0],
+		);
+	});
+
+	it("stops a retained handle and waits for its blob before discarding failed startup", async () => {
+		stubBrowserCapture();
+		const recorder = Object.assign(new EventTarget(), {
+			state: "recording" as RecordingState,
+			stop: vi.fn(() => {
+				recorder.state = "inactive";
+			}),
+		});
+		vi.spyOn(recorder, "addEventListener").mockImplementationOnce(() => {
+			throw new Error("later setup failed");
+		});
+		let finishBlob: ((blob: Blob) => void) | undefined;
+		const failed = {
+			recorder: recorder as unknown as MediaRecorder,
+			recordedBlobPromise: new Promise<Blob>((resolve) => {
+				finishBlob = resolve;
+			}),
+			isStreaming: () => true,
+			discard: vi.fn(async () => undefined),
+		};
+		vi.mocked(createRecorderHandle).mockReturnValueOnce(failed);
+		const view = renderHook(() => useScreenRecorder());
+		await settle();
+		await act(async () => {
+			await view.result.current.startRecordingImmediately();
+		});
+		expect(recorder.stop).toHaveBeenCalledOnce();
+		expect(failed.discard).not.toHaveBeenCalled();
+		finishBlob?.(new Blob());
+		await settle();
+		expect(failed.discard).toHaveBeenCalledOnce();
+		expect(api.setRecordingState).toHaveBeenCalledWith(false);
+		expect(view.result.current.recording).toBe(false);
+	});
+});
+
 describe("useScreenRecorder Restart that does not start a new take", () => {
 	it("says the take was discarded on native Windows", async () => {
 		stubElectronAPI("win32");
@@ -224,5 +311,112 @@ describe("useScreenRecorder Restart that does not start a new take", () => {
 		expect(getUserMedia).toHaveBeenCalledTimes(2);
 		expect(view.result.current.recording).toBe(true);
 		expect(toast.error).not.toHaveBeenCalledWith("recording.restartFailed");
+	});
+});
+
+function stubWindowsCamera() {
+	stubElectronAPI("win32");
+	api.getRecordingPrefs.mockResolvedValue({
+		camEnabled: true,
+		camQuality: "1080p",
+		micEnabled: false,
+		systemAudioEnabled: false,
+		cursorCaptureMode: "editable-overlay",
+	});
+	const track = { stop: vi.fn(), onended: null, getSettings: () => ({ deviceId: "camera-1" }) };
+	const getUserMedia = vi.fn(async () => ({
+		getTracks: () => [track],
+		getVideoTracks: () => [track],
+	}));
+	Object.defineProperty(navigator, "mediaDevices", {
+		configurable: true,
+		value: { getUserMedia },
+	});
+	return { getUserMedia, track };
+}
+
+describe("Windows camera handoff back to the idle preview", () => {
+	it("waits for Cancel to release the helper before reacquiring the enabled camera", async () => {
+		const { getUserMedia, track } = stubWindowsCamera();
+		const view = renderHook(() => useScreenRecorder());
+		await startTake(view);
+		expect(track.stop).toHaveBeenCalled();
+		expect(view.result.current.webcamPreviewStream).toBeNull();
+		const calls = getUserMedia.mock.calls.length;
+		let finishStop: ((result: { success: boolean; discarded: boolean }) => void) | undefined;
+		api.stopNativeWindowsRecording.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishStop = resolve;
+				}),
+		);
+		await act(async () => view.result.current.cancelRecording());
+		expect(getUserMedia).toHaveBeenCalledTimes(calls);
+		await act(async () => finishStop?.({ success: true, discarded: true }));
+		await settle();
+		expect(view.result.current.recording).toBe(false);
+		expect(view.result.current.webcamEnabled).toBe(true);
+		expect(view.result.current.webcamPreviewStream).not.toBeNull();
+		expect(getUserMedia).toHaveBeenCalledTimes(calls + 1);
+	});
+
+	it("reacquires the enabled camera when the native start fails", async () => {
+		const { getUserMedia, track } = stubWindowsCamera();
+		api.startNativeWindowsRecording.mockResolvedValueOnce({ success: false, error: "no helper" });
+		const view = renderHook(() => useScreenRecorder());
+		await settle();
+		const calls = getUserMedia.mock.calls.length;
+		await act(async () => {
+			view.result.current.toggleRecording();
+		});
+		await settle(3_500);
+		expect(view.result.current.recording).toBe(false);
+		expect(track.stop).toHaveBeenCalled();
+		expect(view.result.current.webcamEnabled).toBe(true);
+		expect(view.result.current.webcamPreviewStream).not.toBeNull();
+		expect(getUserMedia).toHaveBeenCalledTimes(calls + 1);
+	});
+
+	it("does not open a competing renderer camera on Restart", async () => {
+		const { getUserMedia } = stubWindowsCamera();
+		const view = renderHook(() => useScreenRecorder());
+		await startTake(view);
+		const calls = getUserMedia.mock.calls.length;
+		await restart(view);
+		expect(view.result.current.recording).toBe(true);
+		expect(api.startNativeWindowsRecording).toHaveBeenCalledTimes(2);
+		expect(getUserMedia).toHaveBeenCalledTimes(calls);
+		expect(view.result.current.webcamPreviewStream).toBeNull();
+	});
+});
+
+describe("Linux fallback preview suspension", () => {
+	it("restores availability when capture resolves after its countdown was cancelled", async () => {
+		const getUserMedia = stubBrowserCapture();
+		api.prepareCameraPreviewCapture = vi.fn(async () => 17);
+		api.restoreCameraPreviewCapture = vi.fn(async () => undefined);
+		const captured = await getUserMedia();
+		let finishCapture: ((stream: typeof captured) => void) | undefined;
+		getUserMedia.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishCapture = resolve;
+				}),
+		);
+		const view = renderHook(() => useScreenRecorder());
+		await settle();
+		await act(async () => view.result.current.toggleRecording());
+		await settle(3500);
+		expect(api.prepareCameraPreviewCapture).toHaveBeenCalledOnce();
+		expect(api.restoreCameraPreviewCapture).not.toHaveBeenCalled();
+		// Replace the pending start with a new countdown, then cancel that countdown.
+		await act(async () => view.result.current.toggleRecording());
+		await settle();
+		await act(async () => view.result.current.cancelRecording());
+		await act(async () => finishCapture?.(captured));
+		await settle();
+		expect(view.result.current.recording).toBe(false);
+		expect(api.restoreCameraPreviewCapture).toHaveBeenCalledWith(17);
+		expect(captured.getTracks()[0].stop).toHaveBeenCalled();
 	});
 });

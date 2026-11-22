@@ -63,6 +63,31 @@ async function resolveDeviceId(
 	}
 }
 
+/**
+ * The camera the user picked in OpenScreen, while it is still connected: what `camera` with no
+ * name records. A system has no default camera, and the first one listed is often a virtual
+ * camera that delivers nothing. With none picked, or the picked one gone, the default.
+ */
+async function usersCamera(): Promise<{
+	deviceId: string | undefined;
+	deviceName: string | undefined;
+}> {
+	const prefs = await window.electronAPI.getRecordingPrefs?.().catch(() => null);
+	const id = prefs?.camDeviceId;
+	const name = prefs?.camDeviceName;
+	if (!id && !name) return { deviceId: undefined, deviceName: undefined };
+	// Ids are listed without a permission grant, labels only with one: the id comes first.
+	const cameras = (await navigator.mediaDevices.enumerateDevices()).filter(
+		(device) => device.kind === "videoinput",
+	);
+	const match =
+		cameras.find((device) => id && device.deviceId === id) ??
+		cameras.find((device) => name && device.label === name);
+	return match
+		? { deviceId: match.deviceId, deviceName: match.label || name || undefined }
+		: { deviceId: undefined, deviceName: undefined };
+}
+
 /** A minimal .openscreen project referencing the finished recording, with all
  * editor settings at their defaults — ready for `openscreen export` or the GUI. */
 function buildDefaultProject(session: {
@@ -84,6 +109,14 @@ function buildDefaultProject(session: {
 		// A new project: it takes the current default format rather than the v2 reading of none.
 		editor: normalizeProjectEditor({ aspectRatio: DEFAULT_PROJECT_APPEARANCE.aspectRatio }),
 	};
+}
+
+/** Advice the caller can act on, for the one failure that names a cursor limitation. The
+ * matched wording is the PipeWire helper's, typed and stable, so it cannot misfire. */
+function withCursorRetryHint(message: string): string {
+	return /advertise METADATA cursor mode/.test(message)
+		? `${message} Retry with "cursor": "system" to record with the system cursor baked in.`
+		: message;
 }
 
 export function CliRecordRunner() {
@@ -185,7 +218,9 @@ export function CliRecordRunner() {
 					setMicrophoneDeviceName(undefined);
 				}
 				if (request.camera) {
-					const camera = await resolveDeviceId("videoinput", request.cameraDevice);
+					const camera = request.cameraDevice
+						? await resolveDeviceId("videoinput", request.cameraDevice)
+						: await usersCamera();
 					setWebcamDeviceId(camera.deviceId);
 					setWebcamDeviceName(camera.deviceName);
 					// The HUD's own check: access granted, and a camera to open.
@@ -228,15 +263,25 @@ export function CliRecordRunner() {
 		phaseRef.current = "recording";
 		void (async () => {
 			try {
-				await startRecordingImmediately();
-				// The hook reports start failures via toast/console, not by
-				// rejecting — without a deadline a failed start would hang the
-				// CLI forever.
+				const outcome = await startRecordingImmediately();
+				// The recorder already knows why: report its reason now, not a guessing deadline.
+				if (outcome.kind !== "started") {
+					// The camera effect may have failed the run already (#1303); its error won.
+					if (phaseRef.current !== "recording") return;
+					await fail(
+						outcome.kind === "cancelled"
+							? new Error("The screen-share picker was dismissed")
+							: new Error(withCursorRetryHint(outcome.message)),
+					);
+					return;
+				}
+				// Started, but `recording` may not have reached this render yet; if it never
+				// does, that is a wiring defect, not a slow capture.
 				setTimeout(() => {
 					if (recordingStartedAtRef.current === null && phaseRef.current === "recording") {
 						void fail(
 							new Error(
-								"Recording did not start within 30s — see stderr for the underlying capture error",
+								"The recording start reported success but the recording state never confirmed it",
 							),
 						);
 					}

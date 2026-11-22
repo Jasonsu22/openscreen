@@ -19,8 +19,13 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
+#include <future>
 #include <iostream>
+#include <memory>
+#include <thread>
 
 namespace {
 
@@ -160,6 +165,12 @@ enum class SinkWriterCreateStage {
 // most the fragment in flight, while the per-fragment box overhead stays
 // negligible against a multi-megabit H.264 payload.
 constexpr UINT64 kFragmentDurationHns = 10'000'000ULL;
+
+// How long a hardware encoder may hold frames without handing a single one on
+// before finalize() calls it stalled. A healthy drain completes in tens of
+// milliseconds; the AMD encoder in getopenscreen/openscreen#1544 consumed no
+// input at all and its drain never completed, which cost a 50 s wait and the take.
+constexpr auto kHardwareFinalizeStallMs = std::chrono::milliseconds(5000);
 
 HRESULT ensureSoftwareH264EncoderRegisteredForProcess() {
     static std::mutex registrationMutex;
@@ -696,6 +707,44 @@ void convertBgraToNv12Bt709(const BYTE* bgra, int stride, int width, int height,
     }
 }
 
+FrameSize fitH264FrameSize(int width, int height, int fps) {
+    constexpr int64_t kMaxFrameMacroblocks = 36'864;
+    constexpr int64_t kMaxMacroblocksPerSecond = 2'073'600;
+    constexpr int kMaxSideMacroblocks = 543;  // sqrt(8 * 36,864)
+    constexpr int kMaxHardwareSide = 4096;
+    const auto macroblocks = [](int pixels) { return (pixels + 15) / 16; };
+    const auto frameMacroblocks = [&](int w, int h) {
+        return static_cast<int64_t>(macroblocks(w)) * macroblocks(h);
+    };
+    // Nearest, not floor: flooring a short side skews the aspect by up to 2px.
+    const auto evenRound = [](double value) { return std::max(2, static_cast<int>(std::lround(value / 2)) * 2); };
+
+    width = (std::max(2, width) / 2) * 2;
+    height = (std::max(2, height) / 2) * 2;
+    // Only the frame size decides, not the rate: a capture that fits at its
+    // size records today, on one encoder or the other, and keeps its pixels.
+    if (frameMacroblocks(width, height) <= kMaxFrameMacroblocks &&
+        macroblocks(width) <= kMaxSideMacroblocks && macroblocks(height) <= kMaxSideMacroblocks) {
+        return {width, height};
+    }
+
+    const int64_t maxMacroblocks =
+        std::min(kMaxFrameMacroblocks, kMaxMacroblocksPerSecond / std::max(1, fps));
+    double scale = std::min(
+        {static_cast<double>(kMaxHardwareSide) / width,
+         static_cast<double>(kMaxHardwareSide) / height,
+         std::sqrt(static_cast<double>(maxMacroblocks) * 256.0 / (static_cast<double>(width) * height))});
+    // Macroblocks round each side up, so the area estimate can land a few
+    // over; step down until it does not.
+    for (;; scale *= 0.999) {
+        const int scaledWidth = evenRound(width * scale);
+        const int scaledHeight = evenRound(height * scale);
+        if (frameMacroblocks(scaledWidth, scaledHeight) <= maxMacroblocks) {
+            return {scaledWidth, scaledHeight};
+        }
+    }
+}
+
 MFEncoder::~MFEncoder() {
     finalize();
 }
@@ -784,6 +833,10 @@ bool MFEncoder::initialize(
     MFEncoderOptions options) {
     width_ = (std::max(2, width) / 2) * 2;
     height_ = (std::max(2, height) / 2) * 2;
+    const bool scaled = options.sourceWidth > 0 && options.sourceHeight > 0 &&
+        (options.sourceWidth != width_ || options.sourceHeight != height_);
+    sourceWidth_ = scaled ? options.sourceWidth : width_;
+    sourceHeight_ = scaled ? options.sourceHeight : height_;
     fps_ = std::max(1, fps);
     device_ = device;
     context_ = context;
@@ -793,11 +846,19 @@ bool MFEncoder::initialize(
     // Leaving the GPU path on would make it prove something else: the DXGI
     // attempt would eat the injection and the run would land on the plain CPU
     // encoder, never reaching the software encoder the knob is aimed at.
-    useDxgiInput_ = options.useDxgiInput && !options.injectDefaultSinkWriterFailureOnce;
+    // The DXGI path converts at the capture size; a scaled capture takes the
+    // CPU readback, behind the scale pass.
+    useDxgiInput_ = options.useDxgiInput && !options.injectDefaultSinkWriterFailureOnce && !scaled;
     videoEncoderSelection_ = kVideoEncoderSelectionDefault;
     videoEncoderRuntime_ = kVideoEncoderRuntimeUnknown;
 
     if (!succeeded(MFStartup(MF_VERSION), "MFStartup")) {
+        return false;
+    }
+
+    if (scaled && !initializeScaler()) {
+        std::cerr << "ERROR: Could not scale the " << sourceWidth_ << "x" << sourceHeight_
+                  << " capture to " << width_ << "x" << height_ << " for H.264" << std::endl;
         return false;
     }
 
@@ -991,9 +1052,16 @@ bool MFEncoder::initialize(
         // composition offsets are what broke the fragmented writer on macOS.
         // Passed as encoding parameters because the encoder only reads this
         // before its types are set: ICodecAPI::SetValue afterwards is refused.
+        //
+        // A key frame every second, set rather than left at the default GOP of 0,
+        // which lets each vendor's encoder choose; some emit a single key frame
+        // at the start. The editor seeks to the key frame before the target and
+        // decodes forward, so on such a file every seek decodes from the start
+        // of the take: minutes on a 10-minute take (#1475).
         Microsoft::WRL::ComPtr<IMFAttributes> encodingParameters;
-        if (SUCCEEDED(MFCreateAttributes(&encodingParameters, 1))) {
+        if (SUCCEEDED(MFCreateAttributes(&encodingParameters, 2))) {
             encodingParameters->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            encodingParameters->SetUINT32(CODECAPI_AVEncMPVGOPSize, static_cast<UINT32>(fps_));
         }
         if (!succeeded(
                 sinkWriter_->SetInputMediaType(videoStreamIndex_, inputType.Get(), encodingParameters.Get()),
@@ -1196,6 +1264,12 @@ bool MFEncoder::copyFrameToBuffer(
         return false;
     }
 
+    if (scaleOutputView_) {
+        if (!scaleFrame(texture)) {
+            return false;
+        }
+        texture = scaleOutputTexture_.Get();
+    }
     context_->CopyResource(stagingTexture_.Get(), texture);
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -1264,6 +1338,126 @@ bool MFEncoder::copyBgraFrameToBuffer(const BgraFrameView& frame, BYTE* destinat
     }
     convertBgraToNv12Bt709(bgraScratch_.data(), static_cast<int>(rowBytes), width_, height_, destination);
     return true;
+}
+
+// The capture is larger than H.264 takes (fitH264FrameSize), so the D3D11 video
+// processor scales each frame down before the readback: BGRA in, BGRA out, at
+// the encoded size. Built here so a driver that refuses it fails the start
+// with a reason instead of the first frame. Captures that fit never get here
+// and pay nothing.
+bool MFEncoder::initializeScaler() {
+    if (!succeeded(device_.As(&videoDevice_), "Query ID3D11VideoDevice(scale)") ||
+        !succeeded(context_.As(&videoContext_), "Query ID3D11VideoContext(scale)")) {
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc{};
+    contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    contentDesc.InputFrameRate = {static_cast<UINT>(fps_), 1};
+    contentDesc.InputWidth = static_cast<UINT>(sourceWidth_);
+    contentDesc.InputHeight = static_cast<UINT>(sourceHeight_);
+    contentDesc.OutputFrameRate = {static_cast<UINT>(fps_), 1};
+    contentDesc.OutputWidth = static_cast<UINT>(width_);
+    contentDesc.OutputHeight = static_cast<UINT>(height_);
+    contentDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    if (!succeeded(
+            videoDevice_->CreateVideoProcessorEnumerator(&contentDesc, &videoProcessorEnumerator_),
+            "CreateVideoProcessorEnumerator(scale)")) {
+        return false;
+    }
+    UINT bgraSupport = 0;
+    if (!succeeded(
+            videoProcessorEnumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &bgraSupport),
+            "CheckVideoProcessorFormat(BGRA)")) {
+        return false;
+    }
+    const UINT inputAndOutput =
+        D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT | D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT;
+    if ((bgraSupport & inputAndOutput) != inputAndOutput) {
+        std::cerr << "ERROR: D3D11 video processor does not scale BGRA" << std::endl;
+        return false;
+    }
+    if (!succeeded(
+            videoDevice_->CreateVideoProcessor(videoProcessorEnumerator_.Get(), 0, &videoProcessor_),
+            "CreateVideoProcessor(scale)")) {
+        return false;
+    }
+
+    const RECT sourceRect{0, 0, sourceWidth_, sourceHeight_};
+    const RECT targetRect{0, 0, width_, height_};
+    videoContext_->VideoProcessorSetOutputTargetRect(videoProcessor_.Get(), TRUE, &targetRect);
+    videoContext_->VideoProcessorSetStreamFrameFormat(
+        videoProcessor_.Get(),
+        0,
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    videoContext_->VideoProcessorSetStreamSourceRect(videoProcessor_.Get(), 0, TRUE, &sourceRect);
+    videoContext_->VideoProcessorSetStreamDestRect(videoProcessor_.Get(), 0, TRUE, &targetRect);
+    // Full-range RGB on both sides: a resize, not a colour conversion. The
+    // BT.709 conversion stays convertBgraToNv12Bt709's, as on every capture.
+    // No driver enhancement either -- the picture is the screen's.
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE colorSpace{};
+    colorSpace.RGB_Range = 0;
+    colorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+    videoContext_->VideoProcessorSetStreamColorSpace(videoProcessor_.Get(), 0, &colorSpace);
+    videoContext_->VideoProcessorSetOutputColorSpace(videoProcessor_.Get(), &colorSpace);
+    videoContext_->VideoProcessorSetStreamAutoProcessingMode(videoProcessor_.Get(), 0, FALSE);
+
+    // A copy of the frame the processor can read, rather than a view on the
+    // caller's texture: that one is created without bind flags, and the views
+    // here are built once instead of per frame.
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = static_cast<UINT>(sourceWidth_);
+    desc.Height = static_cast<UINT>(sourceHeight_);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    if (!succeeded(device_->CreateTexture2D(&desc, nullptr, &scaleInputTexture_), "CreateTexture2D(scale input)")) {
+        return false;
+    }
+    desc.Width = static_cast<UINT>(width_);
+    desc.Height = static_cast<UINT>(height_);
+    if (!succeeded(device_->CreateTexture2D(&desc, nullptr, &scaleOutputTexture_), "CreateTexture2D(scale output)")) {
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc{};
+    inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc{};
+    outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    return succeeded(
+               videoDevice_->CreateVideoProcessorInputView(
+                   scaleInputTexture_.Get(),
+                   videoProcessorEnumerator_.Get(),
+                   &inputViewDesc,
+                   &scaleInputView_),
+               "CreateVideoProcessorInputView(scale)") &&
+        succeeded(
+               videoDevice_->CreateVideoProcessorOutputView(
+                   scaleOutputTexture_.Get(),
+                   videoProcessorEnumerator_.Get(),
+                   &outputViewDesc,
+                   &scaleOutputView_),
+               "CreateVideoProcessorOutputView(scale)");
+}
+
+bool MFEncoder::scaleFrame(ID3D11Texture2D* texture) {
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Width != static_cast<UINT>(sourceWidth_) || desc.Height != static_cast<UINT>(sourceHeight_)) {
+        std::cerr << "ERROR: Captured frame is " << desc.Width << "x" << desc.Height << ", expected "
+                  << sourceWidth_ << "x" << sourceHeight_ << std::endl;
+        return false;
+    }
+    context_->CopyResource(scaleInputTexture_.Get(), texture);
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = scaleInputView_.Get();
+    return succeeded(
+        videoContext_->VideoProcessorBlt(videoProcessor_.Get(), scaleOutputView_.Get(), 0, 1, &stream),
+        "VideoProcessorBlt(scale)");
 }
 
 bool MFEncoder::initializeDxgiPipeline() {
@@ -1996,6 +2190,69 @@ bool MFEncoder::writeAudio(const BYTE* data, DWORD byteCount, int64_t timestampH
     return written;
 }
 
+bool MFEncoder::finalizeSinkWriter() {
+    if (std::strcmp(videoEncoderRuntime_, kVideoEncoderRuntimeHardware) != 0) {
+        return succeeded(sinkWriter_->Finalize(), "SinkWriter::Finalize");
+    }
+
+    // On its own thread so this one can watch the encoder. A drain that moves
+    // at all is left to finish, however long it takes; only an encoder that
+    // still owes frames and has handed nothing on for kHardwareFinalizeStallMs
+    // is abandoned. Without statistics there is no way to tell, and the
+    // shutdown watchdog stays the only bound, as before.
+    auto result = std::make_shared<std::promise<HRESULT>>();
+    std::future<HRESULT> done = result->get_future();
+    std::thread worker([writer = sinkWriter_, result] {
+        const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        result->set_value(writer->Finalize());
+        if (SUCCEEDED(comHr)) {
+            CoUninitialize();
+        }
+    });
+
+    auto readProgress = [&](ULONGLONG& progress, bool& owesFrames) {
+        MF_SINK_WRITER_STATISTICS stats{};
+        stats.cb = sizeof(stats);
+        if (FAILED(sinkWriter_->GetStatistics(videoStreamIndex_, &stats))) {
+            return false;
+        }
+        progress = stats.qwNumSamplesEncoded + stats.qwNumSamplesProcessed + stats.qwByteCountProcessed;
+        owesFrames = stats.qwNumSamplesEncoded < stats.qwNumSamplesReceived;
+        return true;
+    };
+    ULONGLONG lastProgress = 0;
+    bool owesFrames = false;
+    bool watching = readProgress(lastProgress, owesFrames);
+    auto lastChange = std::chrono::steady_clock::now();
+    while (done.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+        ULONGLONG progress = 0;
+        if (!watching || !readProgress(progress, owesFrames)) {
+            watching = false;
+            continue;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (progress != lastProgress || !owesFrames) {
+            lastProgress = progress;
+            lastChange = now;
+        } else if (now - lastChange >= kHardwareFinalizeStallMs) {
+            hardwareEncoderStalled_ = true;
+            // Finalize() may never return: leave its thread behind.
+            worker.detach();
+            std::cerr << "ERROR: The hardware H.264 encoder stopped producing output and its "
+                      << "Finalize() did not complete; abandoning it." << std::endl;
+            return false;
+        }
+    }
+    // Joined so the worker drops its sink writer reference before finalize()
+    // releases ours and shuts Media Foundation down.
+    worker.join();
+    return succeeded(done.get(), "SinkWriter::Finalize");
+}
+
+bool MFEncoder::hardwareEncoderStalled() const {
+    return hardwareEncoderStalled_;
+}
+
 bool MFEncoder::finalize() {
     std::scoped_lock writerLock(writerMutex_);
     if (finalized_) {
@@ -2007,11 +2264,21 @@ bool MFEncoder::finalize() {
     if (sinkWriter_) {
         // The last frame keeps its nominal 1/fps: nothing follows it.
         ok = writePendingVideoSample();
-        ok = succeeded(sinkWriter_->Finalize(), "SinkWriter::Finalize") && ok;
+        ok = finalizeSinkWriter() && ok;
+        if (hardwareEncoderStalled_) {
+            // Finalize() is still inside the encoder on another thread. Releasing
+            // the sink writer or shutting Media Foundation down under it can hang
+            // or crash; the caller ends the process instead.
+            return false;
+        }
     }
     pendingVideoSample_.Reset();
     releaseSinkWriter();
     stagingTexture_.Reset();
+    scaleOutputView_.Reset();
+    scaleInputView_.Reset();
+    scaleOutputTexture_.Reset();
+    scaleInputTexture_.Reset();
     // Before MFShutdown(), not left to the destructor. Two of the objects
     // releaseDxgiPipeline() drops -- videoSampleAllocator_ and
     // dxgiDeviceManager_ -- are Media Foundation objects, and releasing those

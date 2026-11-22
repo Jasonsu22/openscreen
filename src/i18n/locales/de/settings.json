@@ -351,7 +351,12 @@
 		"done": "Fertig",
 		"ratio": "Verhältnis",
 		"cropVideo": "Video zuschneiden",
-		"lockAspectRatio": "Seitenverhältnis sperren"
+		"lockAspectRatio": "Seitenverhältnis sperren",
+		"x": "X (px)",
+		"y": "Y (px)",
+		"width": "Breite (px)",
+		"height": "Höhe (px)",
+		"position": "Position und Größe des Ausschnitts in Pixeln"
 	},
 	"zoom": {
 		"position": {
@@ -388,6 +393,7 @@
 	},
 	"audio": {
 		"outputGain": "Ausgangspegel",
+		"muteRecording": "Aufnahme stummschalten",
 		"help": "Stimmen werden automatisch auf eine Standardlautheit gebracht. Passe den Ausgangspegel davon ausgehend an; er gilt in der Vorschau und im Export identisch.",
 		"reset": "Audio zurücksetzen",
 		"title": "Audio"

@@ -1,3 +1,6 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { UUID } from "builder-util-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	blockedFromInstalling,
@@ -5,7 +8,24 @@ import {
 	downloadSelfUpdate,
 	type InstallReadiness,
 	installSelfUpdate,
+	isPerUserCopy,
+	NSIS_INSTALL_KEY,
 } from "./auto-updater";
+
+const { PER_USER_DIR, PER_USER_EXE } = vi.hoisted(() => {
+	const dir = "C:\\Users\\Hélène\\AppData\\Local\\Programs\\Openscreen";
+	return { PER_USER_DIR: dir, PER_USER_EXE: `${dir}\\Openscreen.exe` };
+});
+
+/** Both hives answer; `reg export` writes the per-user location as UTF-16, like reg.exe. */
+function bothInstallsQuery(_command: string, args?: readonly string[]) {
+	if (args?.[0] === "export") {
+		const escaped = PER_USER_DIR.replace(/\\/g, "\\\\");
+		const body = `Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\${NSIS_INSTALL_KEY}]\r\n"InstallLocation"="${escaped}"\r\n`;
+		fs.writeFileSync(args[2], `\ufeff${body}`, "utf16le");
+	}
+	return { status: 0 } as ReturnType<typeof spawnSync>;
+}
 
 const mocks = vi.hoisted(() => ({
 	// Deliberately initialised to electron-updater's DEFAULTS, so a test asserting they are
@@ -18,11 +38,38 @@ const mocks = vi.hoisted(() => ({
 		downloadUpdate: vi.fn(),
 		quitAndInstall: vi.fn(),
 	},
-	app: { isPackaged: true, getVersion: vi.fn(() => "1.9.2") },
+	app: {
+		isPackaged: true,
+		getVersion: vi.fn(() => "1.9.2"),
+		getPath: vi.fn(() => PER_USER_EXE),
+	},
+	installWindowsUpdate: vi.fn(),
+	assertWindowsUpdateIdle: vi.fn(),
+	requestMacMcpShutdown: vi.fn(),
 }));
 
 vi.mock("electron", () => ({ app: mocks.app }));
 vi.mock("electron-updater", () => ({ autoUpdater: mocks.autoUpdater }));
+vi.mock("./mcp/mac-update-shutdown", () => ({
+	requestMacMcpShutdown: mocks.requestMacMcpShutdown,
+}));
+vi.mock("./windows-update", () => ({
+	installWindowsUpdate: mocks.installWindowsUpdate,
+	assertWindowsUpdateIdle: mocks.assertWindowsUpdateIdle,
+}));
+vi.mock("node:child_process", () => ({ spawnSync: vi.fn() }));
+
+function missingInstallQuery(_command: string, args?: readonly string[]) {
+	const root = args?.[1]?.startsWith("HKLM") ? "HKEY_LOCAL_MACHINE" : "HKEY_CURRENT_USER";
+	return {
+		status: args?.includes("/v") ? 1 : 0,
+		stdout: `\r\n${root}\\Software\\OtherApp\r\n`,
+	} as ReturnType<typeof spawnSync>;
+}
+
+beforeEach(() => {
+	vi.mocked(spawnSync).mockReset().mockImplementation(missingInstallQuery);
+});
 
 function state(overrides: Partial<InstallReadiness> = {}): InstallReadiness {
 	return { recording: false, inApplicationsFolder: true, platform: "linux", ...overrides };
@@ -41,6 +88,12 @@ describe("blockedFromInstalling", () => {
 		for (const platform of ["win32", "darwin", "linux"] as const) {
 			expect(blockedFromInstalling(state({ platform, recording: true }))).toBe("recording");
 		}
+	});
+
+	it("blocks a Windows handoff with unsaved editor changes", () => {
+		expect(blockedFromInstalling(state({ platform: "win32", editorHasUnsavedChanges: true }))).toBe(
+			"unsaved-changes",
+		);
 	});
 
 	// App Translocation: a quarantined app runs from a read-only image where Squirrel cannot
@@ -77,6 +130,8 @@ describe("self-update flow", () => {
 		mocks.autoUpdater.checkForUpdates.mockReset();
 		mocks.autoUpdater.downloadUpdate.mockReset();
 		mocks.autoUpdater.quitAndInstall.mockReset();
+		mocks.installWindowsUpdate.mockReset();
+		mocks.requestMacMcpShutdown.mockReset();
 	});
 
 	it("never touches the updater on a channel a package manager owns", async () => {
@@ -148,11 +203,250 @@ describe("self-update flow", () => {
 		expect(result).toMatchObject({ error: { message: "connection reset" } });
 	});
 
-	// isSilent=false so a per-machine Windows install can show its UAC prompt — a silent upgrade
-	// of a Program Files install hits elevation and, if dismissed, quits having done nothing.
-	// isForceRunAfter=true so the app comes back.
-	it("hands over to the installer non-silently and relaunches", async () => {
-		await installSelfUpdate();
-		expect(mocks.autoUpdater.quitAndInstall).toHaveBeenCalledWith(false, true);
+	// Other platforms retain electron-updater's own quit/relaunch handoff.
+	it("asks macOS MCP sessions to close before handing the update to Squirrel", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "darwin" });
+		try {
+			await installSelfUpdate();
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.requestMacMcpShutdown).toHaveBeenCalledWith({
+			executablePath: process.execPath,
+			version: "1.9.2",
+		});
+		expect(mocks.requestMacMcpShutdown.mock.invocationCallOrder[0]).toBeLessThan(
+			mocks.autoUpdater.quitAndInstall.mock.invocationCallOrder[0],
+		);
+	});
+
+	it("does not close MCP sessions when the install readiness check fails", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "darwin" });
+		try {
+			await installSelfUpdate(() => false);
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.requestMacMcpShutdown).not.toHaveBeenCalled();
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+	});
+	it("still installs when the MCP shutdown marker cannot be published", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "darwin" });
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		mocks.requestMacMcpShutdown.mockImplementation(() => {
+			throw new Error("cache is read-only");
+		});
+		try {
+			await expect(installSelfUpdate()).resolves.toBeUndefined();
+			expect(warning).toHaveBeenCalledWith(
+				"[updater] Could not notify MCP sessions of the update:",
+				expect.any(Error),
+			);
+			expect(mocks.autoUpdater.quitAndInstall).toHaveBeenCalledWith(true, true);
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+			warning.mockRestore();
+		}
+	});
+
+	it("retains quitAndInstall on macOS and Linux", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		try {
+			for (const value of ["darwin", "linux"]) {
+				Object.defineProperty(process, "platform", { value });
+				await installSelfUpdate();
+			}
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.autoUpdater.quitAndInstall).toHaveBeenCalledTimes(2);
+		expect(mocks.autoUpdater.quitAndInstall).toHaveBeenCalledWith(true, true);
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+	});
+
+	// A bare /S run would move the per-user copy to Program Files behind UAC (rc.1 defect).
+	it.each([
+		[PER_USER_EXE, "HKCU"],
+		["C:\\Program Files\\Openscreen\\Openscreen.exe", "HKLM"],
+	])("pins the running copy (%s) when both installs answer", async (exe, hive) => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		mocks.app.getPath.mockReturnValueOnce(exe);
+		vi.mocked(spawnSync).mockImplementation(bothInstallsQuery);
+		const canInstall = () => true;
+		try {
+			await installSelfUpdate(canInstall);
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+			vi.mocked(spawnSync).mockImplementation(missingInstallQuery);
+		}
+		expect(mocks.installWindowsUpdate).toHaveBeenCalledWith(expect.any(Function), canInstall, hive);
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+	});
+
+	it("keeps the app open when the per-user location cannot be read", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		vi.mocked(spawnSync).mockReturnValue({ status: 0 } as ReturnType<typeof spawnSync>);
+		try {
+			await expect(installSelfUpdate()).rejects.toThrow("Could not confirm");
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+			vi.mocked(spawnSync).mockImplementation(missingInstallQuery);
+		}
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+	});
+
+	it("waits for the Windows installer without quitting before the UAC decision", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		const canInstall = vi.fn(() => true);
+		let finish: (() => void) | undefined;
+		mocks.installWindowsUpdate.mockImplementation(async (download: () => Promise<string[]>) => {
+			await download();
+			await new Promise<void>((resolve) => {
+				finish = resolve;
+			});
+		});
+		mocks.autoUpdater.downloadUpdate.mockResolvedValue(["verified-installer.exe"]);
+		vi.mocked(spawnSync).mockImplementation((command, args) =>
+			args?.[1]?.startsWith("HKLM")
+				? ({ status: 0 } as ReturnType<typeof spawnSync>)
+				: missingInstallQuery(command, args),
+		);
+		Object.defineProperty(process, "platform", { value: "win32" });
+		try {
+			let settled = false;
+			const install = installSelfUpdate(canInstall).then(() => {
+				settled = true;
+			});
+			await vi.waitFor(() => expect(mocks.autoUpdater.downloadUpdate).toHaveBeenCalledOnce());
+			expect(settled).toBe(false);
+			expect(mocks.installWindowsUpdate).toHaveBeenCalledWith(
+				expect.any(Function),
+				canInstall,
+				"HKLM",
+			);
+			expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+			finish?.();
+			await install;
+		} finally {
+			finish?.();
+			if (platform) Object.defineProperty(process, "platform", platform);
+			vi.mocked(spawnSync).mockImplementation(missingInstallQuery);
+		}
+	});
+
+	it("does not request elevation for a per-user Windows update", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		try {
+			await installSelfUpdate();
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.autoUpdater.quitAndInstall).toHaveBeenCalledWith(true, true);
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+	});
+
+	it("does not enter a legacy Windows handoff while another elevation is pending", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		mocks.assertWindowsUpdateIdle.mockImplementationOnce(() => {
+			throw new Error("A Windows update is pending");
+		});
+		try {
+			await expect(installSelfUpdate()).rejects.toThrow("Windows update is pending");
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+	});
+
+	it.each(["HKLM", "HKCU"])("keeps the app open when the %s query fails", async (hive) => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		vi.mocked(spawnSync).mockImplementation((command, args) =>
+			args?.[1]?.startsWith(hive)
+				? ({ status: null } as ReturnType<typeof spawnSync>)
+				: missingInstallQuery(command, args),
+		);
+		try {
+			await expect(installSelfUpdate()).rejects.toThrow(
+				"Could not confirm the Windows installation type",
+			);
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+			vi.mocked(spawnSync).mockImplementation(missingInstallQuery);
+		}
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		"HKLM",
+		"HKCU",
+	])("does not mistake a failed %s value query for absence", async (hive) => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		vi.mocked(spawnSync).mockImplementation((command, args) => {
+			if (!args?.[1]?.startsWith(hive)) return missingInstallQuery(command, args);
+			if (args.includes("/v")) return { status: 1 } as ReturnType<typeof spawnSync>;
+			const root = hive === "HKLM" ? "HKEY_LOCAL_MACHINE" : "HKEY_CURRENT_USER";
+			return {
+				status: 0,
+				stdout: `${root}\\${NSIS_INSTALL_KEY}\r\n`,
+			} as ReturnType<typeof spawnSync>;
+		});
+		try {
+			await expect(installSelfUpdate()).rejects.toThrow("Could not confirm");
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+	});
+
+	it("keeps the app open when parent enumeration also fails", async () => {
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { value: "win32" });
+		vi.mocked(spawnSync).mockReturnValue({ status: 1 } as ReturnType<typeof spawnSync>);
+		try {
+			await expect(installSelfUpdate()).rejects.toThrow("Could not confirm");
+		} finally {
+			if (platform) Object.defineProperty(process, "platform", platform);
+		}
+		expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+		expect(mocks.installWindowsUpdate).not.toHaveBeenCalled();
+	});
+});
+
+describe("isPerUserCopy", () => {
+	it("matches the running exe to the per-user install, ignoring case and a trailing slash", () => {
+		expect(isPerUserCopy(PER_USER_EXE, PER_USER_DIR)).toBe(true);
+		expect(isPerUserCopy(PER_USER_EXE.toUpperCase(), `${PER_USER_DIR}\\`)).toBe(true);
+	});
+
+	it("does not mistake the per-machine copy, or a sibling folder, for it", () => {
+		expect(isPerUserCopy("C:\\Program Files\\Openscreen\\Openscreen.exe", PER_USER_DIR)).toBe(
+			false,
+		);
+		expect(isPerUserCopy(`${PER_USER_DIR}2\\Openscreen.exe`, PER_USER_DIR)).toBe(false);
+	});
+
+	it("refuses to guess without a per-user location", () => {
+		expect(() => isPerUserCopy(PER_USER_EXE, null)).toThrow("Could not confirm");
+	});
+
+	it("reads the key electron-builder derives from the appId", () => {
+		const appId = fs
+			.readFileSync("electron-builder.json5", "utf8")
+			.match(/"appId": "([^"]+)"/)?.[1];
+		const ns = UUID.parse("50e065bc-3134-11e6-9bab-38c9862bdaf3"); // electron-builder's NsisTarget
+		expect(NSIS_INSTALL_KEY).toBe(`Software\\${UUID.v5(appId ?? "", ns)}`);
 	});
 });

@@ -34,9 +34,9 @@ OpenScreen is a free, MIT-licensed screen recorder and video editor for Windows,
 
 - **huggingface.co, once.** The first transcription downloads the Whisper model, about 264 MB, and a voice-detection model under 1 MB, each checked against a SHA-256 hash. After that, transcription needs no connection.
 - **github.com, once per language.** On a machine with a GPU, the first English or French transcription also downloads the model that re-times each word: about 110 MB for English, 350 MB for French.
-- **github.com and api.github.com.** Builds that update themselves check for a new release every 24 hours, and when you ask. By default they only tell you one is available.
+- **github.com and api.github.com.** Builds that update themselves check for a new release a minute after launch, then every six hours, and when you ask. They download it in the background and show an update button; nothing is installed until you click it.
 - **fonts.googleapis.com, only for a font added in 1.x.** A custom annotation font added in an earlier version is still fetched at launch, though 2.x no longer draws it.
-- **PostHog, once a day.** An anonymous count of active installs, sent to PostHog's EU servers. It holds the app version, the operating system, the processor architecture, how the app was installed, whether it was used directly or through its MCP server by an AI agent, and whether it is the first count of the week and of the month. That is all: no installation identifier (each count gets a new random ID), no IP address kept, nothing about your recordings. Untick **Send Anonymous Usage Count** in the tray menu to turn it off, or set `DO_NOT_TRACK=1`.
+- **PostHog, once a day.** An anonymous count of active installs, sent to PostHog's EU servers. It holds the app version, the operating system, the processor architecture, how the app was installed, whether it was used directly or through its MCP server by an AI agent, whether it is the first count of the week and of the month, and the week the app was installed. That is all: no installation identifier (each count gets a new random ID), no IP address kept, nothing about your recordings. Untick **Send Anonymous Usage Count** in the tray menu to turn it off, or set `DO_NOT_TRACK=1`.
 - **Your AI provider, only if you connect one.** Chat editing sends your messages and the project data it reads, such as the timeline and transcript. Caption translation sends the caption text. Both stay off until you connect a provider. See [AI editing](./ai-editing.md).
 
 ## Does OpenScreen collect analytics or crash reports?
@@ -44,7 +44,7 @@ OpenScreen is a free, MIT-licensed screen recorder and video editor for Windows,
 **One anonymous daily count, nothing else.** The app contains no analytics or crash-reporting SDK, and nothing records what you do in it.
 
 - Once a day, the app reports that one installation was active. [Does OpenScreen work offline?](#does-openscreen-work-offline) lists exactly what that count holds and how to turn it off.
-- The count carries no installation identifier: each one gets a new random ID, and nothing else in it is specific to your computer.
+- The count carries no installation identifier: each one gets a new random ID, and nothing else in it is specific to your computer. The install week it carries, such as `2026-W44`, is the week of installation, the same for everyone who installed that week, not an identifier.
 - AI provider keys are stored encrypted with Electron's `safeStorage`. If encryption is unavailable, the key is not saved.
 
 ## Is OpenScreen safe to install?
@@ -79,7 +79,7 @@ OpenScreen is a free, MIT-licensed screen recorder and video editor for Windows,
 ## Can I install OpenScreen with winget, Homebrew or Flathub?
 
 - **winget:** yes, through the Store source: `winget install --source msstore OpenScreen`.
-- **Homebrew:** yes, from the official tap: `brew install --cask getopenscreen/openscreen/openscreen`. Every stable release updates the cask.
+- **Homebrew:** yes: `brew install --cask openscreen`, from Homebrew's main cask list, or from the official tap: `brew install --cask getopenscreen/openscreen/openscreen`. Both follow every stable release. The old `siddharthvaddem/openscreen` tap stops at v1.5.0.
 - **Flathub:** there is no listing.
 
 ## Is this the original OpenScreen project?
@@ -88,7 +88,7 @@ OpenScreen is a free, MIT-licensed screen recorder and video editor for Windows,
 
 - Siddharth Vaddem created OpenScreen and archived the [original repository](https://github.com/siddharthvaddem/openscreen) after v1.5.0.
 - Development moved to [getopenscreen/openscreen](https://github.com/getopenscreen/openscreen) with his approval, under the same name and the same MIT license.
-- The archived README calls this project a community-driven spin-off led by one of the core contributors. That is Etienne Lescot, who maintains it. The README's link, github.com/EtienneLescot/openscreen, redirects to the current repository.
+- The archived README now points to this repository. Etienne Lescot, one of the original core contributors, maintains it.
 - The archived repository receives no updates. [Picking up OpenScreen](/blog/2026/06/15/picking-up-openscreen/) explains the handover.
 
 ## Is OpenScreen related to openscreen.io or openscreen.net?

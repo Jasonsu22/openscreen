@@ -8,7 +8,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CursorTelemetryPoint } from "../../src/components/video-editor/types";
 import type { CliDoneResult, CliRequest } from "../../src/lib/cliContracts";
 import { DocumentService } from "../ai-edition/document-service";
@@ -18,6 +18,7 @@ import {
 	frameTimes,
 	type MediaToolDeps,
 	mediaPreamble,
+	NO_WEBCAM_PICTURE,
 	pointerSamples,
 	type TakeRecorder,
 } from "./media-tools";
@@ -26,11 +27,14 @@ import {
 	createToolRunner,
 	type McpToolDeps,
 } from "./openscreen-mcp-server";
+import { RecordingCompletion } from "./recording-completion";
 
 /** The runner windows: records what was asked, answers like a runner would. */
 class FakeRunners {
 	readonly started: CliRequest[] = [];
 	recordStarts = true;
+	/** The `run.done` error a failed record start reports, when `recordStarts` is false. */
+	recordStartError: string | undefined;
 	/** The webcam the next take records beside the screen, if any. */
 	webcam: { path: string; offsetMs: number } | null = null;
 	results: Partial<Record<CliRequest["kind"], CliDoneResult>> = {};
@@ -90,7 +94,10 @@ class FakeRunners {
 		} else if (this.recordStarts) {
 			queueMicrotask(() => handlers.onLog?.("info", "Recording started"));
 		} else {
-			finish({ success: false, error: "Recording did not start within 30s" });
+			finish({
+				success: false,
+				error: this.recordStartError ?? "Recording did not start within 30s",
+			});
 		}
 		return { window, done, close };
 	}
@@ -118,6 +125,7 @@ let runners: FakeRunners;
 let closed: number;
 let openVideoFails: boolean;
 let client: Client;
+let media: ReturnType<typeof createMediaTools>;
 /** The stdio server's media deps: the in-app tests reuse its stand-ins. */
 let stdioDeps: MediaToolDeps;
 /** The addon's frame renderer, when a test gives it one: none by default, as an older addon. */
@@ -177,7 +185,8 @@ beforeEach(async () => {
 		runTool,
 		now: () => 1_000,
 	};
-	const server = createOpenScreenMcpServer(toolDeps, runTool, createMediaTools(stdioDeps));
+	media = createMediaTools(stdioDeps);
+	const server = createOpenScreenMcpServer(toolDeps, runTool, media);
 
 	const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
 	await server.connect(serverSide);
@@ -260,6 +269,32 @@ describe("frameTimes", () => {
 });
 
 describe("recording", () => {
+	it("stays busy until a stopped take has finished saving its project", async () => {
+		expect(media.isBusy()).toBe(false);
+		await call("startRecording", { window: "My App" });
+		expect(media.isBusy()).toBe(true);
+		let releaseSave: () => void = () => undefined;
+		const saveGate = new Promise<void>((resolve) => {
+			releaseSave = resolve;
+		});
+		let savingStarted: () => void = () => undefined;
+		const saving = new Promise<void>((resolve) => {
+			savingStarted = resolve;
+		});
+		const createProject = documents.createProject.bind(documents);
+		vi.spyOn(documents, "createProject").mockImplementation(async (...args) => {
+			savingStarted();
+			await saveGate;
+			return createProject(...args);
+		});
+		const stopped = call("stopRecording", { title: "Update waits for this save" });
+		await saving;
+		expect(runners.open).toBe(0);
+		expect(media.isBusy()).toBe(true);
+		releaseSave();
+		expect((await stopped).isError).toBeFalsy();
+		expect(media.isBusy()).toBe(false);
+	});
 	it("records one window, then turns the take into a project the document tools can edit", async () => {
 		const started = await call("startRecording", { window: "My App", systemAudio: true });
 		expect(started.isError).toBeFalsy();
@@ -322,7 +357,14 @@ describe("recording", () => {
 		});
 	});
 
-	it("records no webcam unless asked, and the default camera for true", async () => {
+	it("says so when the webcam asked for recorded no picture", async () => {
+		await call("startRecording", { camera: true });
+		expect(JSON.parse(textOf(await call("stopRecording"))).warnings).toEqual([NO_WEBCAM_PICTURE]);
+		await call("startRecording", {});
+		expect(JSON.parse(textOf(await call("stopRecording"))).warnings).toBeUndefined();
+	});
+
+	it("records no webcam unless asked, and the user's camera for true", async () => {
 		await call("startRecording", {});
 		await call("stopRecording");
 		await call("startRecording", { camera: true });
@@ -370,6 +412,17 @@ describe("recording", () => {
 		expect((await call("stopRecording")).isError).toBe(true);
 	});
 
+	it("carries the recorder's own failure reason to the client", async () => {
+		runners.recordStarts = false;
+		const reason =
+			'The ScreenCast portal does not advertise METADATA cursor mode, so real cursor positions cannot be obtained on this session. Retry with "cursor": "system" to record with the system cursor baked in.';
+		runners.recordStartError = reason;
+		const started = await call("startRecording", { display: 1 });
+		expect(started.isError).toBe(true);
+		expect(textOf(started)).toContain(reason);
+		expect((await call("stopRecording")).isError).toBe(true);
+	});
+
 	it("saves a take once when two stops arrive together", async () => {
 		await call("startRecording", { window: "My App" });
 		const [first, second] = await Promise.all([call("stopRecording"), call("stopRecording")]);
@@ -389,6 +442,42 @@ describe("recording", () => {
 });
 
 describe("createProject", () => {
+	it.each([
+		false,
+		true,
+	])("keeps project creation busy through its checkpoint (video=%s)", async (video) => {
+		await fs.writeFile(videoPath, "video");
+		let release: () => void = () => undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reachedCheckpoint: () => void = () => undefined;
+		const checkpoint = new Promise<void>((resolve) => {
+			reachedCheckpoint = resolve;
+		});
+		const runTool = stdioDeps.runTool;
+		vi.spyOn(stdioDeps, "runTool").mockImplementation(async (...args) => {
+			if (args[0] === "createCheckpoint") {
+				reachedCheckpoint();
+				await gate;
+			}
+			return runTool(...args);
+		});
+		const creating = call("createProject", video ? { videoPath } : { title: "Blank" });
+		await checkpoint;
+		const busyWhileSaving = media.isBusy();
+		release();
+		const created = await creating;
+		expect(created.isError).toBeFalsy();
+		expect(busyWhileSaving).toBe(true);
+		expect(media.isBusy()).toBe(false);
+	});
+
+	it("clears project-creation activity after a failed save", async () => {
+		vi.spyOn(documents, "createProject").mockRejectedValueOnce(new Error("disk unavailable"));
+		expect((await call("createProject", { title: "Fails" })).isError).toBe(true);
+		expect(media.isBusy()).toBe(false);
+	});
 	it("creates an empty project the document tools can edit at once", async () => {
 		const created = await call("createProject", { title: "  Blank  " });
 		expect(created.isError).toBeFalsy();
@@ -594,14 +683,72 @@ describe("setPointerTrack", () => {
 		expect(textOf(set)).not.toContain("Tool failed");
 	});
 
-	it("refuses a project whose take this server did not record", async () => {
-		const other = await documents.createProject("Imported");
+	it("refuses a project with no video", async () => {
+		const other = await documents.createProject("Empty");
 		const refused = await call("setPointerTrack", {
 			projectId: other.project.id,
 			events: [{ at: 1, x: 0.5, y: 0.5 }],
+			recordingStartedAt: 0,
+		});
+		expect(refused.isError).toBe(true);
+		expect(textOf(refused)).toContain("no video");
+	});
+
+	it("asks for recordingStartedAt for a video it did not record, before writing anything", async () => {
+		await fs.rm(`${videoPath}.cursor.json`);
+		await fs.writeFile(videoPath, "video");
+		const { projectId } = JSON.parse(textOf(await call("createProject", { videoPath })));
+		const refused = await call("setPointerTrack", {
+			projectId,
+			events: [{ at: 5_000, x: 0.5, y: 0.5, click: true }],
 		});
 		expect(refused.isError).toBe(true);
 		expect(textOf(refused)).toContain("not recorded by this server");
+		expect(textOf(refused)).toContain("recordingStartedAt");
+		expect(await sidecarFile(videoPath)).toBeNull();
+	});
+
+	it("gives a video from createProject a pointer on the client's clock, undone by its checkpoint", async () => {
+		// A capture made frame by frame: its actions are logged in milliseconds into the video.
+		await fs.rm(`${videoPath}.cursor.json`);
+		await fs.writeFile(videoPath, "video");
+		const created = JSON.parse(textOf(await call("createProject", { videoPath })));
+		expect(created.autoZooms).toBe(0);
+
+		const set = await call("setPointerTrack", {
+			projectId: created.projectId,
+			events: [
+				{ at: 2_000, x: 0.3, y: 0.4 },
+				{ at: 5_000, x: 0.6, y: 0.5, click: true },
+			],
+			recordingStartedAt: 0,
+		});
+		expect(set.isError).toBeFalsy();
+		const { autoZoomsAdded } = JSON.parse(textOf(set));
+		expect(autoZoomsAdded).toBeGreaterThan(0);
+		const click = (await readSidecar(videoPath)).find((s) => s.interactionType === "click");
+		expect(click).toMatchObject({ timeMs: 5_000, cx: 0.6 });
+		expect((await documents.getProject(created.projectId)).zoomRanges).toHaveLength(autoZoomsAdded);
+
+		const restored = await call("restoreCheckpoint", {
+			projectId: created.projectId,
+			checkpointId: created.checkpointId,
+		});
+		expect(restored.isError).toBeFalsy();
+		expect(await sidecarFile(videoPath)).toBeNull();
+		expect((await documents.getProject(created.projectId)).zoomRanges).toHaveLength(0);
+	});
+
+	it("puts the client's recordingStartedAt before the take's own", async () => {
+		await fs.rm(`${videoPath}.cursor.json`);
+		const take = await recordTake();
+		await call("setPointerTrack", {
+			projectId: take.projectId,
+			events: clickAt(take, 0.5),
+			recordingStartedAt: take.recordingStartedAt + 1_000,
+		});
+		const click = (await readSidecar(take.videoPath)).find((s) => s.interactionType === "click");
+		expect(click?.timeMs).toBe(4_000);
 	});
 });
 
@@ -1067,5 +1214,205 @@ describe("the media tools in the app", () => {
 			?.path as { description?: string };
 		expect(exportPath.description).toContain("absolute path ending in");
 		expect(exportPath.description).not.toContain("working directory, ending");
+	});
+});
+
+describe("waitForRecording through MCP", () => {
+	const clients: Client[] = [];
+	afterEach(async () => {
+		for (const client of clients.splice(0)) await client.close();
+	});
+	async function observing(
+		completion: RecordingCompletion,
+		overrides: Partial<MediaToolDeps> = {},
+	) {
+		const deps: McpToolDeps = {
+			transport: "http",
+			host: { snapshot: async () => null, apply: async () => "no-editor" },
+			projects: documents,
+			editsAllowed: () => false,
+			version: "test",
+		};
+		let subscribed: () => void = () => undefined;
+		const subscription = new Promise<void>((resolve) => {
+			subscribed = resolve;
+		});
+		const media = createMediaTools({
+			...stdioDeps,
+			transport: "http",
+			recordingActive: () => completion.isActive(),
+			editsAllowed: () => false,
+			waitForRecording: (timeout, signal) => {
+				const waiting = completion.wait(timeout, signal);
+				subscribed();
+				return waiting;
+			},
+			...overrides,
+		});
+		const server = createOpenScreenMcpServer(deps, createToolRunner(deps), media);
+		const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+		await server.connect(serverSide);
+		const observer = new Client({ name: "observer", version: "1" });
+		await observer.connect(clientSide);
+		clients.push(observer);
+		return { observer, subscription };
+	}
+
+	it("returns the stopRecording fields for a user take while MCP edits is off, without recording commands", async () => {
+		const project = await documents.createProject("User take");
+		const completion = new RecordingCompletion();
+		completion.started(42, 1_000);
+		const { observer, subscription } = await observing(completion);
+		const waiting = observer.callTool({ name: "waitForRecording", arguments: {} });
+		await subscription;
+		completion.saved(42, videoPath);
+		completion.completed(42, {
+			projectId: project.project.id,
+			videoPath,
+			durationSec: 12,
+			autoZooms: 2,
+		});
+		const result = await waiting;
+		expect(result.isError).toBeFalsy();
+		expect(JSON.parse(textOf(result as CallToolResult))).toEqual({
+			projectId: project.project.id,
+			videoPath,
+			durationSec: 12,
+			autoZooms: 2,
+			recordingStartedAt: 1_000,
+			checkpointId: expect.any(String),
+		});
+		expect(runners.started).toEqual([]);
+	});
+
+	it("gives setPointerTrack the waited-for take's start, as stopRecording does", async () => {
+		const project = await documents.createProject("User take");
+		const completion = new RecordingCompletion();
+		completion.started(42, 1_000);
+		const sent: unknown[] = [];
+		const { observer, subscription } = await observing(completion, {
+			runTool: async (_name, args) => {
+				sent.push(args);
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		});
+		const waiting = observer.callTool({ name: "waitForRecording", arguments: {} });
+		await subscription;
+		completion.saved(42, videoPath);
+		completion.completed(42, {
+			projectId: project.project.id,
+			videoPath,
+			durationSec: 12,
+			autoZooms: 0,
+		});
+		await waiting;
+		await observer.callTool({
+			name: "setPointerTrack",
+			arguments: { projectId: project.project.id, events: [{ at: 1, x: 0.5, y: 0.5 }] },
+		});
+		expect(sent).toContainEqual(expect.objectContaining({ takes: { [videoPath]: 1_000 } }));
+	});
+
+	it("releases a client take after the user finishes it, so startRecording can record again", async () => {
+		const completion = new RecordingCompletion();
+		let id = 0;
+		const recorder: TakeRecorder = {
+			start: async () => {
+				completion.started(++id);
+				return {
+					startedAt: id,
+					stop: async () => {
+						throw new Error("wait must never stop the take");
+					},
+				};
+			},
+		};
+		const { observer, subscription } = await observing(completion, {
+			recorder,
+			editsAllowed: () => true,
+		});
+		expect(
+			(await observer.callTool({ name: "startRecording", arguments: {} })).isError,
+		).toBeFalsy();
+		const waiting = observer.callTool({ name: "waitForRecording", arguments: {} });
+		await subscription;
+		completion.saved(1, videoPath);
+		completion.completed(1, { projectId: "proj_take", videoPath, durationSec: 12, autoZooms: 0 });
+		await waiting;
+		expect(
+			(await observer.callTool({ name: "startRecording", arguments: {} })).isError,
+		).toBeFalsy();
+		expect(id).toBe(2);
+	});
+
+	it("keeps a take that is still starting claimed when a wait finds nothing to observe", async () => {
+		const completion = new RecordingCompletion();
+		let begin: () => void = () => undefined;
+		const countdown = new Promise<void>((resolve) => {
+			begin = resolve;
+		});
+		let starts = 0;
+		const recorder: TakeRecorder = {
+			start: async () => {
+				starts++;
+				await countdown;
+				completion.started(1);
+				return {
+					startedAt: 1,
+					stop: async () => ({ projectId: "p", videoPath, durationSec: 1, autoZooms: 0 }),
+				};
+			},
+		};
+		const { observer } = await observing(completion, { recorder, editsAllowed: () => true });
+		const starting = observer.callTool({ name: "startRecording", arguments: {} });
+		const waited = await observer.callTool({ name: "waitForRecording", arguments: {} });
+		expect(textOf(waited as CallToolResult)).toContain("No recording");
+		const second = await observer.callTool({ name: "startRecording", arguments: {} });
+		expect(textOf(second as CallToolResult)).toContain("already running");
+		begin();
+		expect((await starting).isError).toBeFalsy();
+		expect(starts).toBe(1);
+	});
+
+	it.each([
+		0,
+		-1,
+		1.5,
+		3601,
+		"10",
+	])("validates timeoutSec=%s before observing", async (timeoutSec) => {
+		const completion = new RecordingCompletion();
+		const { observer } = await observing(completion);
+		const result = await observer.callTool({ name: "waitForRecording", arguments: { timeoutSec } });
+		expect(result.isError).toBe(true);
+		expect(textOf(result as CallToolResult)).toContain("validation");
+	});
+
+	it("reports no active recording as a tool error", async () => {
+		const { observer } = await observing(new RecordingCompletion());
+		const result = await observer.callTool({ name: "waitForRecording", arguments: {} });
+		expect(result.isError).toBe(true);
+		expect(textOf(result as CallToolResult)).toContain("No recording");
+	});
+
+	it("propagates MCP cancellation and leaves the user's take available", async () => {
+		const completion = new RecordingCompletion();
+		completion.started(42);
+		const { observer, subscription } = await observing(completion);
+		const abort = new AbortController();
+		const waiting = expect(
+			observer.callTool({ name: "waitForRecording", arguments: {} }, undefined, {
+				signal: abort.signal,
+			}),
+		).rejects.toThrow();
+		await subscription;
+		abort.abort();
+		await waiting;
+		// Flush the MCP cancellation notification, then the same take still completes.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const retry = completion.wait(1000, new AbortController().signal);
+		completion.saved(42, videoPath);
+		completion.completed(42, { projectId: "proj_take", videoPath, durationSec: 12, autoZooms: 0 });
+		await expect(retry).resolves.toMatchObject({ projectId: "proj_take" });
 	});
 });

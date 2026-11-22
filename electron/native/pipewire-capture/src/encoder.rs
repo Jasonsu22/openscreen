@@ -177,6 +177,165 @@ fn vaapi_is_safe_to_probe() -> bool {
     }
 }
 
+/// True when the Vulkan device behind `device` has a queue family that encodes
+/// H.264 — the exact lookup `h264_vulkan` makes in `avcodec_open2` (issue #1340).
+///
+/// WHY ASK BEFORE OPENING. A driver can advertise VK_KHR_video_encode_queue on
+/// a GPU with no H.264 encode queue (RADV on an AMD Carrizo, in the report).
+/// ffmpeg 8.1 then fails with "Encoding of h264 is not supported by this device" and
+/// segfaults while freeing the half-built encoder, so the ladder never reaches
+/// libopenh264. Asking Vulkan first turns that crash into a skipped rung.
+///
+/// Read through Vulkan itself rather than `AVVulkanDeviceContext::qf`, because
+/// that struct needs the Vulkan headers to bind and the build does not have
+/// them. Only its first four pointer-sized fields are read: `alloc`,
+/// `get_proc_addr`, `inst` and `phys_dev`, in that order in the vendored 8.1.
+///
+/// SAFETY: `device` is a live AV_HWDEVICE_TYPE_VULKAN device context.
+unsafe fn vulkan_can_encode_h264(device: *mut ff::AVBufferRef) -> bool {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct DeviceHead {
+        alloc: *const c_void,
+        get_proc_addr: Option<GetInstanceProcAddr>,
+        instance: *mut c_void,
+        physical_device: *mut c_void,
+    }
+    #[repr(C)]
+    struct QueueFamilyVideoProperties {
+        s_type: i32,
+        p_next: *mut c_void,
+        codec_operations: u32,
+    }
+    #[repr(C)]
+    struct QueueFamilyProperties2 {
+        s_type: i32,
+        p_next: *mut c_void,
+        queue_flags: u32,
+        queue_count: u32,
+        timestamp_valid_bits: u32,
+        min_image_transfer_granularity: [u32; 3],
+    }
+    type GetInstanceProcAddr =
+        unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char) -> *const c_void;
+    type GetQueueFamilyProperties2 =
+        unsafe extern "C" fn(*mut c_void, *mut u32, *mut QueueFamilyProperties2);
+
+    const STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2: i32 = 1_000_059_005;
+    const STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR: i32 = 1_000_023_012;
+    const QUEUE_VIDEO_ENCODE_BIT_KHR: u32 = 0x40;
+    const VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR: u32 = 0x0001_0000;
+
+    let context = (*device).data as *const ff::AVHWDeviceContext;
+    let head = (*context).hwctx as *const DeviceHead;
+    let Some(get_proc_addr) = (*head).get_proc_addr else {
+        return false;
+    };
+    let query = get_proc_addr(
+        (*head).instance,
+        c"vkGetPhysicalDeviceQueueFamilyProperties2".as_ptr(),
+    );
+    if query.is_null() {
+        return false;
+    }
+    let query: GetQueueFamilyProperties2 = std::mem::transmute(query);
+
+    let mut count = 0u32;
+    query((*head).physical_device, &mut count, ptr::null_mut());
+    let mut video: Vec<QueueFamilyVideoProperties> = (0..count)
+        .map(|_| QueueFamilyVideoProperties {
+            s_type: STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR,
+            p_next: ptr::null_mut(),
+            codec_operations: 0,
+        })
+        .collect();
+    let mut families: Vec<QueueFamilyProperties2> = video
+        .iter_mut()
+        .map(|video| QueueFamilyProperties2 {
+            s_type: STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
+            p_next: (video as *mut QueueFamilyVideoProperties).cast(),
+            queue_flags: 0,
+            queue_count: 0,
+            timestamp_valid_bits: 0,
+            min_image_transfer_granularity: [0; 3],
+        })
+        .collect();
+    query((*head).physical_device, &mut count, families.as_mut_ptr());
+
+    families.iter().zip(&video).take(count as usize).any(|(family, video)| {
+        family.queue_flags & QUEUE_VIDEO_ENCODE_BIT_KHR != 0
+            && video.codec_operations & VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR != 0
+    })
+}
+
+/// True for a Vulkan device whose H.264 encode opens but writes a broken file.
+///
+/// RADV on the Raven family (Raven, Picasso, Raven2: VCN 1.0) advertises an
+/// H.264 encode queue once `video_encode` is enabled, and `h264_vulkan` opens on
+/// it, but the take comes out with blocks of older content stuck in the picture
+/// and few distinct frames (issue #1465, a Ryzen 5 3550H). libopenh264 records
+/// the same screen cleanly, so the ladder must fall through to it.
+///
+/// Mesa names these devices "... (RADV RAVEN)" and "... (RADV RAVEN2)".
+// ponytail: matched by name on one report; widen to other VCN generations only
+// if a take from one shows the same corruption.
+fn vulkan_encode_is_broken_on(device_name: &str) -> bool {
+    device_name.contains("(RADV RAVEN")
+}
+
+/// The `deviceName` of the physical device behind `device`, read the same way
+/// as [`vulkan_can_encode_h264`]: through Vulkan, from the first four fields of
+/// `AVVulkanDeviceContext`. Empty if Vulkan does not expose the query.
+///
+/// SAFETY: `device` is a live AV_HWDEVICE_TYPE_VULKAN device context.
+unsafe fn vulkan_device_name(device: *mut ff::AVBufferRef) -> String {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct DeviceHead {
+        alloc: *const c_void,
+        get_proc_addr: Option<GetInstanceProcAddr>,
+        instance: *mut c_void,
+        physical_device: *mut c_void,
+    }
+    /// `VkPhysicalDeviceProperties`: the fields up to `deviceName`, then room for
+    /// the rest (824 bytes in all on 64-bit), which is not read.
+    #[repr(C, align(8))]
+    struct Properties {
+        api_version: u32,
+        driver_version: u32,
+        vendor_id: u32,
+        device_id: u32,
+        device_type: i32,
+        device_name: [std::ffi::c_char; 256],
+        rest: [u8; 1024],
+    }
+    type GetInstanceProcAddr =
+        unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char) -> *const c_void;
+    type GetProperties = unsafe extern "C" fn(*mut c_void, *mut Properties);
+
+    let context = (*device).data as *const ff::AVHWDeviceContext;
+    let head = (*context).hwctx as *const DeviceHead;
+    let Some(get_proc_addr) = (*head).get_proc_addr else {
+        return String::new();
+    };
+    let query = get_proc_addr((*head).instance, c"vkGetPhysicalDeviceProperties".as_ptr());
+    if query.is_null() {
+        return String::new();
+    }
+    let query: GetProperties = std::mem::transmute(query);
+    let mut properties: Properties = std::mem::zeroed();
+    query((*head).physical_device, &mut properties);
+    // The zeroed tail guarantees a terminator even from a driver that filled all
+    // 256 bytes of the name.
+    let last = properties.device_name.len() - 1;
+    properties.device_name[last] = 0;
+    CStr::from_ptr(properties.device_name.as_ptr())
+        .to_string_lossy()
+        .into_owned()
+}
+
 const RTLD_LAZY: i32 = 1;
 const RTLD_LOCAL: i32 = 0;
 
@@ -496,6 +655,17 @@ impl VideoEncoder {
                 "av_hwdevice_ctx_create: {}",
                 ff::err_to_string(created)
             ));
+        }
+        if device_type == ff::AV_HWDEVICE_TYPE_VULKAN && !vulkan_can_encode_h264(self.hw_device) {
+            return Err("the Vulkan device has no H.264 encode queue".to_owned());
+        }
+        if device_type == ff::AV_HWDEVICE_TYPE_VULKAN {
+            let name = vulkan_device_name(self.hw_device);
+            if vulkan_encode_is_broken_on(&name) {
+                return Err(format!(
+                    "h264_vulkan corrupts its output on {name} (VCN 1.0, issue #1465)"
+                ));
+            }
         }
 
         self.hw_frames = ff::av_hwframe_ctx_alloc(self.hw_device);
@@ -1675,6 +1845,16 @@ mod tests {
         let one_frame = 1.0 / f64::from(fps);
         assert!((second_frame_at - one_frame).abs() < 1e-3, "frame 1 at {second_frame_at} s");
         let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn vulkan_is_skipped_on_vcn1_radv_only() {
+        assert!(vulkan_encode_is_broken_on("AMD Radeon Vega 8 Graphics (RADV RAVEN)"));
+        assert!(vulkan_encode_is_broken_on("AMD Radeon Vega 3 Graphics (RADV RAVEN2)"));
+        assert!(!vulkan_encode_is_broken_on("AMD Radeon Graphics (RADV RENOIR)"));
+        assert!(!vulkan_encode_is_broken_on("AMD Radeon RX 7600 (RADV NAVI33)"));
+        assert!(!vulkan_encode_is_broken_on("NVIDIA GeForce GTX 1650"));
+        assert!(!vulkan_encode_is_broken_on(""));
     }
 
     #[test]
